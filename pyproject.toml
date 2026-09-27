@@ -1,0 +1,16 @@
+[project]
+name = "lmfs-assignment1"
+version = "0.1.0"
+description = "LMFS Assignment 1: BPE and Transformer"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "numpy",
+    "regex",
+    "torch",
+    "wandb==0.30.0",
+    "pytest",
+]
+
+[tool.uv]
+package = false
+python-preference = "managed"
