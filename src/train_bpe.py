@@ -1,24 +1,29 @@
-"""Train a byte-level BPE tokenizer and print a short summary."""
+"""Train and save a byte-level BPE tokenizer, then print a short summary."""
 
 from __future__ import annotations
 
 import argparse
-import time
-from pathlib import Path
-
-from bpe import BPE
 import logging
+import pathlib
+import time
 
-DEFAULT_TRAIN_FILE = Path("/data/nlp_course/1-basic-data/owt_train.txt")
+import bpe
+
+DEFAULT_TRAIN_FILE = pathlib.Path("/data/nlp_course/1-basic-data/owt_train.txt")
 DEFAULT_VOCAB_SIZE = 32_000
 DEFAULT_SPECIAL_TOKENS = ["<|endoftext|>"]
+OUTPUT_FILE = pathlib.Path("tokenizer.pkl")
 logger = logging.getLogger(__name__)
 
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a byte-level BPE tokenizer")
+    """Parses command-line training options."""
+    parser = argparse.ArgumentParser(
+        description="Train a byte-level BPE tokenizer"
+    )
     parser.add_argument(
         "--train-file",
-        type=Path,
+        type=pathlib.Path,
         default=DEFAULT_TRAIN_FILE,
         help=f"UTF-8 training corpus (default: {DEFAULT_TRAIN_FILE})",
     )
@@ -42,9 +47,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Trains and saves a tokenizer, then logs training results."""
     logging.basicConfig(
-        level=logging.INFO,
-        format="[%(levelname)s] %(asctime)s: %(message)s"
+        level=logging.INFO, format="[%(levelname)s] %(asctime)s: %(message)s"
     )
     args = parse_args()
     if not args.train_file.is_file():
@@ -56,17 +61,19 @@ def main() -> None:
         else DEFAULT_SPECIAL_TOKENS
     )
 
-    bpe = BPE()
+    tokenizer = bpe.BPE()
     started = time.perf_counter()
-    bpe.train(args.train_file, args.vocab_size, special_tokens)
+    tokenizer.train(args.train_file, args.vocab_size, special_tokens)
     elapsed = time.perf_counter() - started
+    tokenizer.save(OUTPUT_FILE)
 
-    logger.info(f"training file: {args.train_file}")
-    logger.info(f"training time: {elapsed:.2f} seconds")
-    logger.info(f"vocabulary size: {len(bpe.vocab)}")
-    logger.info(f"merge count: {len(bpe.merges)}")
+    logger.info("saved tokenizer: %s", OUTPUT_FILE.resolve())
+    logger.info("training file: %s", args.train_file)
+    logger.info("training time: %.2f seconds", elapsed)
+    logger.info("vocabulary size: %d", len(tokenizer.vocab))
+    logger.info("merge count: %d", len(tokenizer.merges))
     logger.info("first 10 merges:")
-    for rank, (left, right) in enumerate(bpe.merges[:10]):
+    for rank, (left, right) in enumerate(tokenizer.merges[:10]):
         print(f"  {rank}: {left!r} + {right!r} -> {left + right!r}")
 
 

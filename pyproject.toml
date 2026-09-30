@@ -11,6 +11,19 @@ dependencies = [
     "pytest",
 ]
 
+[dependency-groups]
+dev = [
+    "black",
+    "pylint",
+]
+
+[tool.black]
+line-length = 80
+target-version = ["py313"]
+
+[tool.pylint.format]
+max-line-length = 80
+
 [tool.uv]
 package = false
 python-preference = "managed"
