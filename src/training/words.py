@@ -8,12 +8,7 @@ import logging
 import os
 import pathlib
 
-import regex
-
-if __package__:
-    from src import utils
-else:
-    import utils
+from src.utils import pretokenization
 
 _TOKEN_ID_BITS = 32
 _TOKEN_ID_MASK = (1 << _TOKEN_ID_BITS) - 1
@@ -103,16 +98,15 @@ class TrainingWords:
     def from_file(
         cls,
         input_path: str | os.PathLike[str],
-        special_tokens: list[str],
         *,
-        pretokenizer: regex.Pattern,
+        pretokenizer: pretokenization.PreTokenizer,
     ) -> TrainingWords:
         """Counts byte strings in memory and packs each distinct word once.
 
         Args:
             input_path: The UTF-8 training corpus.
-            special_tokens: Delimiters excluded from ordinary pre-tokens.
-            pretokenizer: The compiled pattern supplied by the tokenizer.
+            pretokenizer: Shared pre-tokenizer configured with literal special
+                tokens to exclude from training.
 
         Returns:
             Packed word sequences with their global corpus frequencies.
@@ -122,12 +116,7 @@ class TrainingWords:
             "r", encoding="utf-8", newline=""
         ) as stream:
             counts = collections.Counter(
-                utils.iter_pretokens(
-                    stream,
-                    special_tokens,
-                    _READ_CHUNK_SIZE,
-                    pretokenizer=pretokenizer,
-                )
+                pretokenizer.iter_stream(stream, _READ_CHUNK_SIZE)
             )
         logger.info("Counted %d distinct pre-tokens.", len(counts))
 

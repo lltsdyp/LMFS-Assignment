@@ -7,3 +7,6 @@ data/
 __pycache__/
 
 *.pkl
+
+outputs/
+wandb/
