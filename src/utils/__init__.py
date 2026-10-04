@@ -1,1 +1,1 @@
-"""Groups pre-tokenization, encoding, lookup-building, and file I/O helpers."""
+"""Tokenizer, file I/O, tensor, and training calculation helpers."""

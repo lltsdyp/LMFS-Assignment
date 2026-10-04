@@ -1,1 +1,1 @@
-"""Implements the LMFS assignment's tokenizer and experiment modules."""
+"""LMFS tokenizer, handwritten components, models, and training utilities."""

@@ -12,7 +12,7 @@ import heapq
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from src.training import words
+    from src.training.bpe import words
 
 _TOKEN_ID_BITS = 32
 _TOKEN_ID_MASK = (1 << _TOKEN_ID_BITS) - 1

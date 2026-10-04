@@ -1,5 +1,49 @@
 # LMFS Assignment 1
 
+## 手写 Transformer 组件库
+
+任务二第一部分按职责分布在 `src/kernels/`（前向算子）、`src/models/`（模型）、
+`src/training/lm/`（优化工具）和 `src/utils/`（公共辅助计算）。已实现基础层、
+RoPE、因果多头注意力、Pre-norm Transformer 语言模型、交叉熵、AdamW、
+warmup + cosine 学习率和全局梯度裁剪。所有核心公式使用 PyTorch 基础张量运算自行实现，
+CPU/CUDA 共用一套公式，基础运算的设备分发由 PyTorch 负责。
+
+按职责导入：
+
+```python
+from src.models import TransformerLM
+from src.training.lm.optim import AdamW, clip_grad_norm_, cosine_learning_rate
+from src.utils.losses import cross_entropy
+```
+
+`src/training/bpe/` 放分词器训练结构，`src/training/lm/` 放语言模型训练工具。
+`kernels/functional.py` 只包含模型前向算子。
+完整组件列表、BPE 接入、参数更新、PPL 汇总和保存恢复示例见
+[kernels 使用文档](src/kernels/README.md)。语言模型训练入口已实现，见
+[训练、验证和续训说明](src/training/lm/README.md)。
+
+## 语言模型训练
+
+默认模型：context length 256、d_model 512、d_ff 1344、RoPE θ 10000、4 层、16 头。
+词表大小使用任务一 BPE 的实际词表大小，模型从随机权重初始化。
+在 4060 上先检查训练流程：
+
+```bash
+uv run python -m src.train_lm \
+  --tokenizer tokenizer.pkl \
+  --train-file data/owt_train.txt \
+  --valid-file data/owt_valid.txt \
+  --device cuda --batch-size 1 --max-steps 300 \
+  --output-dir outputs/lm-4060
+```
+
+`--tokenizer` 替换成任务一保存的实际路径。脚本使用自己的 BPE 流式编码并缓存，
+每 100 次更新记录训练 PPL，最后保存模型并对完整验证文本计算 PPL。
+启动时自动打印和保存源码，默认关闭 W&B；`--wandb-mode online` 开启源码和标量记录。
+默认累计预算 6 小时，包含初始化、数据准备、训练、保存和最终验证。
+缓存准备、A100 运行、预算预留和 checkpoint 续训命令见
+[训练说明](src/training/lm/README.md)。
+
 ## 安装依赖
 
 需要 Python 3.13 和 uv。在项目根目录执行：
@@ -8,7 +52,7 @@
 uv sync
 ```
 
-## 命令行训练、验证及 W&B 记录
+## BPE 命令行训练、验证及 W&B 记录
 
 训练和验证语料均为 UTF-8 文本文件。首次使用 W&B 可执行 `uv run wandb login`。
 在项目根目录执行：
@@ -120,15 +164,32 @@ assignment1/
 │   ├── evaluation.py           # 全文计时、还原检查、token 明细
 │   ├── wandb_record.py         # W&B 生命周期及源码记录
 │   ├── train_bpe.py            # CLI 配置及训练、保存、重载、验证流程
+│   ├── train_lm.py             # LM CLI、训练循环、记录及预算管理
+│   ├── kernels/                # 手写前向算子、基础层、RoPE 和 MHA
+│   ├── models/
+│   │   ├── __init__.py
+│   │   └── transformer.py      # Transformer 配置、block 和完整语言模型
 │   ├── training/
 │   │   ├── __init__.py
-│   │   ├── words.py            # TrainingWords：训练语料与字节序列
-│   │   └── pairs.py            # PairState、HeapEntry、频次与候选堆
+│   │   ├── bpe/
+│   │   │   ├── __init__.py
+│   │   │   ├── words.py        # TrainingWords：BPE 训练语料与字节序列
+│   │   │   └── pairs.py        # PairState、HeapEntry、频次与候选堆
+│   │   └── lm/
+│   │       ├── __init__.py
+│   │       ├── optim.py        # AdamW、学习率和全局梯度裁剪
+│   │       ├── data.py         # 自己的 BPE 编码缓存、采样和验证窗口
+│   │       ├── checkpoint.py   # 模型、优化器、随机状态与计时保存恢复
+│   │       └── validation.py   # 全量真实文本验证与 PPL 汇总
 │   └── utils/
 │       ├── __init__.py
 │       ├── pretokenization.py  # 共享 PreTokenizer：正则、特殊 token 和流式边界
 │       ├── indexes.py          # 特殊 token 词表补齐与编码索引构建
 │       ├── serializer.py       # pickle 文件读写
+│       ├── losses.py           # 手写稳定交叉熵和 NLL 计算
+│       ├── metrics.py          # 总 NLL / 目标数换算 PPL
+│       ├── source.py           # 启动时打印并保存源码快照
+│       ├── tensors.py          # 张量累积精度和设备一致性检查
 │       └── encoding.py         # 预词编码、按排名 merge 和缓存操作
 ├── tests/                      # 训练、编码、持久化及验证测试
 ├── data/                       # 训练与验证数据，不提交版本库
@@ -141,7 +202,9 @@ assignment1/
 课程适配函数 `run_train_bpe()` 和 `get_tokenizer()` 位于 `src/bpe.py`。
 
 `BPE` 管理词表、查找索引、编码缓存及训练和编码主流程。训练专用的数据结构
-放在 `training/`，其中两个较小的 pair 状态类与候选操作共同位于 `pairs.py`。
+放在 `training/bpe/`，其中两个较小的 pair 状态类与候选操作共同位于 `pairs.py`。
+语言模型训练工具单独放在 `training/lm/`。BPE 训练不导入语言模型或 PyTorch，
+语言模型训练沿用已训练的 BPE 编码，不依赖 BPE 的词频表或 merge 候选堆。
 预分词和编码逻辑放在 `utils/`，不依赖 `BPE` 实例。`PreTokenizer` 统一管理
 课程给定的 `PAT`、特殊 token 校验及匹配，提供完整文本、连续片段和文件流入口。
 训练通过 `iter_stream()` 获取普通预分词，编码通过 `iter_text()` 或

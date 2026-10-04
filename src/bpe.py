@@ -1,7 +1,7 @@
 """Trains, encodes, and decodes text with a byte-level BPE tokenizer.
 
 BPE owns vocabulary construction and the incremental merge loop. Training data
-structures and pair helpers live in training. Text and encoding helpers
+structures and pair helpers live in training.bpe. Text and encoding helpers
 live in utils.pretokenization and utils.encoding. BPE owns the encoding flow,
 model lookups, cache, byte decoding, and model persistence. utils.serializer
 handles pickle file operations. utils.indexes builds encoding lookup tables
@@ -16,8 +16,8 @@ import logging
 import os
 import pathlib
 
-from src.training import pairs
-from src.training import words
+from src.training.bpe import pairs
+from src.training.bpe import words
 from src.utils import encoding
 from src.utils import indexes
 from src.utils import pretokenization

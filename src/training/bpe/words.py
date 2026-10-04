@@ -1,4 +1,4 @@
-"""Stores and loads compact word sequences used by BPE training."""
+"""Stores and loads compact word sequences used only by BPE training."""
 
 from __future__ import annotations
 

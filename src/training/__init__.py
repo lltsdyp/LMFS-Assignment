@@ -1,1 +1,1 @@
-"""Contains byte-level BPE training data and pair candidate management."""
+"""Separate bpe and lm training packages; imports do not start training."""
