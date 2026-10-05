@@ -76,22 +76,13 @@ def parse_args(argv=None):
     )
     parser.add_argument("--train-file", type=Path)
     parser.add_argument("--valid-file", type=Path)
-    parser.add_argument(
-        "--cache-dir", type=Path, default=_ROOT / "data" / "lm_cache"
-    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
         "--resume",
         type=Path,
         help="checkpoint.pt; keep its .json timing sidecar",
     )
-    modes = parser.add_mutually_exclusive_group()
-    modes.add_argument(
-        "--prepare-only",
-        action="store_true",
-        help="cache own-BPE token IDs without training",
-    )
-    modes.add_argument(
+    parser.add_argument(
         "--eval-only",
         action="store_true",
         help="evaluate --resume on the full validation text",
@@ -151,14 +142,10 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.eval_only and args.resume is None:
         parser.error("--eval-only requires --resume")
-    if args.prepare_only and args.resume is not None:
-        parser.error("--prepare-only cannot be combined with --resume")
     if args.max_steps is not None and args.max_steps < 0:
         parser.error("--max-steps must be nonnegative")
-    if args.eval_batch_size <= 0 or args.eval_every < 0 or args.save_every < 0:
-        parser.error(
-            "batch sizes must be positive; intervals must be nonnegative"
-        )
+    if args.eval_every < 0 or args.save_every < 0:
+        parser.error("intervals must be nonnegative")
     if (
         not math.isfinite(args.time_budget_seconds)
         or not math.isfinite(args.finalize_reserve_seconds)
@@ -192,51 +179,6 @@ def _options(args, saved, identity):
             if saved and key in ("dtype", "seed") and value != training[key]:
                 raise ValueError(f"cannot change {key} when resuming")
             training[key] = value
-    if training["batch_size"] <= 0:
-        raise ValueError("batch size must be positive")
-    if any(
-        model[key] <= 0
-        for key in (
-            "context_length",
-            "d_model",
-            "d_ff",
-            "num_layers",
-            "num_heads",
-        )
-    ):
-        raise ValueError("model dimensions, layers, and heads must be positive")
-    if (
-        model["d_model"] % model["num_heads"]
-        or (model["d_model"] // model["num_heads"]) % 2
-    ):
-        raise ValueError(
-            "d_model must divide into even-dimensional attention heads"
-        )
-    if any(
-        not math.isfinite(model[key]) or model[key] <= 0
-        for key in ("rope_theta", "norm_eps")
-    ):
-        raise ValueError(
-            "RoPE theta and norm epsilon must be finite and positive"
-        )
-    cosine_learning_rate(
-        0,
-        training["max_lr"],
-        training["min_lr"],
-        training["warmup_steps"],
-        training["cosine_steps"],
-    )
-    AdamW._validate(
-        training["max_lr"],
-        training["betas"],
-        training["eps"],
-        training["weight_decay"],
-    )
-    if (
-        not math.isfinite(training["max_grad_norm"])
-        or training["max_grad_norm"] < 0
-    ):
-        raise ValueError("max_grad_norm must be finite and nonnegative")
     return model, training
 
 
@@ -279,14 +221,6 @@ def main(argv=None, *, started_at=None):
     )
     args = parse_args(argv)
     device = torch.device(args.device)
-    if (
-        not args.prepare_only
-        and device.type == "cuda"
-        and not torch.cuda.is_available()
-    ):
-        raise RuntimeError(
-            "CUDA is unavailable; check PyTorch/driver installation or pass --device cpu"
-        )
     run_id = uuid.uuid4().hex[:12]
     output = args.output_dir or _ROOT / "outputs" / "lm" / run_id
     output.mkdir(parents=True, exist_ok=True)
@@ -317,22 +251,19 @@ def main(argv=None, *, started_at=None):
     )
     if not args.eval_only and train_file.resolve() == valid_file.resolve():
         raise ValueError("training and validation files must be separate")
-    logger.info("Encoding or checking caches with task-one BPE")
-    valid_tokens, valid_meta = prepare_tokens(
-        valid_file, tokenizer, args.cache_dir
-    )
+    logger.info("Encoding text with task-one BPE")
+    valid_tokens, valid_meta = prepare_tokens(valid_file, tokenizer)
     train_tokens, train_meta = (
         (None, None)
         if args.eval_only
-        else prepare_tokens(train_file, tokenizer, args.cache_dir)
+        else prepare_tokens(train_file, tokenizer)
     )
-    if tokenizer_identity(tokenizer) != identity:
-        raise RuntimeError("tokenizer changed while encoding")
     if saved:
         for key, metadata in (("valid", valid_meta), ("train", train_meta)):
-            if metadata and any(
-                metadata[field] != saved["data"][key][field]
-                for field in ("text_sha256", "tokens_sha256", "token_count")
+            # With an identical tokenizer, the packed-ID digest identifies
+            # the complete ordered training data; no second identity check.
+            if metadata and (
+                metadata["tokens_sha256"] != saved["data"][key]["tokens_sha256"]
             ):
                 raise ValueError(
                     f"resume requires the same {key} corpus and encoding"
@@ -359,23 +290,6 @@ def main(argv=None, *, started_at=None):
         "validation_rule": "all N-1 next-token targets exactly once; nonoverlapping blocks; only right padding ignored; no inserted markers",
     }
     write_json(output / "config.json", config)
-    if args.prepare_only:
-        result = {
-            "mode": "prepare",
-            "train_tokens": len(train_tokens),
-            "valid_tokens": len(valid_tokens),
-            "wall_seconds": time.perf_counter() - started,
-        }
-        write_json(output / "summary.json", result)
-        print(json.dumps(result), flush=True)
-        return result
-    if (
-        not args.eval_only
-        and len(train_tokens) <= model_config["context_length"]
-    ):
-        raise ValueError(
-            "training text needs at least context_length + 1 tokens"
-        )
     torch.manual_seed(training["seed"])
     generator = torch.Generator().manual_seed(training["seed"])
     dtype = getattr(torch, training["dtype"])

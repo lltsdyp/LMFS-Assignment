@@ -1,0 +1,13 @@
+[project]
+name = "lmfs-bpe-native"
+version = "0.1.0"
+description = "Parallel Rust encoding for the assignment BPE tokenizer"
+requires-python = ">=3.13"
+
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "_lmfs_bpe"
+bindings = "pyo3"

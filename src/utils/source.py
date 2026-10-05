@@ -6,11 +6,23 @@ from pathlib import Path
 import shutil
 
 
+def implementation_paths(project_root: Path) -> list[Path]:
+    """Lists Python/Rust implementation and native build configuration files."""
+    paths = sorted((project_root / "src").rglob("*.py"))
+    paths += sorted((project_root / "rust" / "src").rglob("*.rs"))
+    paths += [
+        project_root / "rust" / name
+        for name in ("pyproject.toml", "Cargo.toml", "Cargo.lock")
+        if (project_root / "rust" / name).is_file()
+    ]
+    return paths
+
+
 def snapshot_sources(project_root: Path, destination: Path) -> dict:
     """Save all implementation modules and dependency files before training."""
     destination.mkdir(parents=True, exist_ok=True)
     manifest = {}
-    paths = sorted((project_root / "src").rglob("*.py"))
+    paths = implementation_paths(project_root)
     paths += [
         project_root / name
         for name in ("pyproject.toml", "uv.lock")
@@ -24,7 +36,7 @@ def snapshot_sources(project_root: Path, destination: Path) -> dict:
         manifest[str(relative)] = hashlib.sha256(
             target.read_bytes()
         ).hexdigest()
-        if path.suffix == ".py":
+        if path.suffix in {".py", ".rs"}:
             print(
                 f"SOURCE {relative}\n{target.read_text(encoding='utf-8')}",
                 flush=True,

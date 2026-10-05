@@ -22,8 +22,6 @@ def cross_entropy(
     check_same_device(logits, targets)
     if targets.shape != logits.shape[:-1]:
         raise ValueError("targets must match logits' leading dimensions")
-    if targets.dtype != torch.int64:
-        raise TypeError("targets must have int64 dtype")
     if reduction not in ("none", "sum", "mean"):
         raise ValueError("reduction must be 'none', 'sum', or 'mean'")
     work = logits.to(compute_dtype(logits))

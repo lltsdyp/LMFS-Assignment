@@ -106,10 +106,6 @@ def main(argv: list[str] | None = None) -> None:
         level=logging.INFO, format="[%(levelname)s] %(asctime)s: %(message)s"
     )
     args = parse_args(argv)
-    if not args.valid_file.is_file():
-        raise FileNotFoundError(
-            f"validation corpus not found: {args.valid_file}"
-        )
     tokenizer = bpe.BPE()
     special_tokens = list(
         dict.fromkeys(
@@ -127,8 +123,6 @@ def main(argv: list[str] | None = None) -> None:
                 "--special-token must match the loaded model settings"
             )
         special_tokens = tokenizer.special_tokens
-    elif not args.train_file.is_file():
-        raise FileNotFoundError(f"training corpus not found: {args.train_file}")
 
     config = {
         "train_file": str(args.train_file.resolve()),

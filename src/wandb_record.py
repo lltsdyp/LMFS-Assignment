@@ -6,6 +6,8 @@ import pathlib
 
 import wandb
 
+from src.utils import source
+
 
 @contextlib.contextmanager
 def experiment(
@@ -37,6 +39,6 @@ def experiment(
 def log_sources(run: wandb.Run, project_root: pathlib.Path) -> None:
     """Records the CLI and all implementation modules as a code artifact."""
     artifact = wandb.Artifact(f"bpe-source-{run.id}", type="code")
-    for path in sorted((project_root / "src").rglob("*.py")):
+    for path in source.implementation_paths(project_root):
         artifact.add_file(str(path), name=str(path.relative_to(project_root)))
     run.log_artifact(artifact)

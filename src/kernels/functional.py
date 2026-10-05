@@ -21,8 +21,6 @@ def linear(x: Tensor, weight: Tensor) -> Tensor:
 def embedding(token_ids: Tensor, weight: Tensor) -> Tensor:
     """Look up rows of (vocab_size, d_model), rejecting negative IDs."""
     check_same_device(token_ids, weight)
-    if token_ids.dtype not in (torch.int32, torch.int64):
-        raise TypeError("token_ids must have int32 or int64 dtype")
     return weight.index_select(0, token_ids.reshape(-1)).reshape(
         *token_ids.shape, weight.shape[1]
     )
@@ -31,8 +29,9 @@ def embedding(token_ids: Tensor, weight: Tensor) -> Tensor:
 def rms_norm(x: Tensor, weight: Tensor, eps: float = 1e-5) -> Tensor:
     """Normalize the last dimension and apply a learnable gain."""
     check_same_device(x, weight)
-    if eps <= 0:
-        raise ValueError("eps must be positive")
+    # Nonfinite epsilon can produce NaNs or silently zero every activation.
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("eps must be finite and positive")
     if weight.shape != (x.shape[-1],):
         raise ValueError("weight must match the last input dimension")
     work = x.to(compute_dtype(x))
@@ -82,8 +81,6 @@ def scaled_dot_product_attention(
     The causal mask is upper-left aligned when sequence lengths differ.
     """
     check_same_device(q, k, v, *(() if mask is None else (mask,)))
-    if q.shape[-1] != k.shape[-1] or k.shape[-2] != v.shape[-2]:
-        raise ValueError("Q/K dimensions and K/V sequence lengths must match")
     work_q, work_k = q.to(compute_dtype(q)), k.to(compute_dtype(k))
     scores = (work_q @ work_k.transpose(-1, -2)) / math.sqrt(q.shape[-1])
     if is_causal:

@@ -1,5 +1,7 @@
 """Rotary position encoding and causal multi-head self-attention."""
 
+import math
+
 import torch
 from torch import Tensor, nn
 
@@ -22,8 +24,11 @@ class RotaryPositionalEmbedding(nn.Module):
         super().__init__()
         if d_k <= 0 or d_k % 2:
             raise ValueError("RoPE head dimension must be positive and even")
-        if theta <= 0 or max_seq_len <= 0:
-            raise ValueError("theta and max_seq_len must be positive")
+        # Nonfinite theta silently changes or invalidates the rotation cache.
+        if not math.isfinite(theta) or theta <= 0 or max_seq_len <= 0:
+            raise ValueError(
+                "theta must be finite/positive; max_seq_len positive"
+            )
         self.d_k = d_k
         self.max_seq_len = max_seq_len
         self.theta = theta
@@ -58,18 +63,16 @@ class RotaryPositionalEmbedding(nn.Module):
         if x.shape[-1] != self.d_k:
             raise ValueError("input's last dimension must match d_k")
         if token_positions is None:
-            if x.shape[-2] > self.max_seq_len:
-                raise ValueError("sequence exceeds RoPE cache length")
             token_positions = torch.arange(x.shape[-2], device=x.device)
         else:
             if token_positions.dtype not in (torch.int32, torch.int64):
                 raise TypeError("token_positions must have integer dtype")
             if token_positions.shape[-1] != x.shape[-2]:
                 raise ValueError("positions must match input sequence length")
-            if torch.any(token_positions < 0) or torch.any(
-                token_positions >= self.max_seq_len
-            ):
-                raise ValueError("token positions are outside the RoPE cache")
+            # Tensor indexing accepts negative positions by wrapping them.
+            # Positive overflow is rejected by the indexing operation itself.
+            if torch.any(token_positions < 0):
+                raise ValueError("token positions must be nonnegative")
         return rotary_embedding(x, self.cos, self.sin, token_positions)
 
 
@@ -86,10 +89,8 @@ class MultiHeadSelfAttention(nn.Module):
         dtype=None,
     ):
         super().__init__()
-        if d_model <= 0 or num_heads <= 0 or d_model % num_heads:
-            raise ValueError(
-                "d_model must be positive and divisible by num_heads"
-            )
+        if num_heads <= 0 or d_model % num_heads:
+            raise ValueError("num_heads must be positive and divide d_model")
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads

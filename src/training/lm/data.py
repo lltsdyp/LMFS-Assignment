@@ -1,30 +1,24 @@
-"""Own-BPE text caching, random training windows, and full validation batches."""
+"""In-memory BPE tokens, random windows, and full validation batches."""
 
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
+import logging
 from pathlib import Path
-import tempfile
+import time
 
 import numpy as np
 import torch
 
 from src.bpe import BPE
 
-
-def file_digest(path: Path) -> str:
-    """Hash actual bytes; preserved raw text is the cache identity."""
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+logger = logging.getLogger(__name__)
 
 
 def tokenizer_identity(tokenizer: BPE) -> dict:
     """Identify vocabulary IDs, ordered merges, and special-token settings."""
+    # Model logits and embeddings index IDs directly from 0 to vocab_size - 1.
     if sorted(tokenizer.vocab) != list(range(len(tokenizer.vocab))):
         raise ValueError("BPE vocabulary IDs must be contiguous from zero")
     payload = {
@@ -48,87 +42,45 @@ def tokenizer_identity(tokenizer: BPE) -> dict:
 def prepare_tokens(
     text_path: Path,
     tokenizer: BPE,
-    cache_dir: Path,
     *,
     chunk_chars: int = 65536,
-) -> tuple[np.memmap, dict]:
-    """Encode unchanged UTF-8 text; reuse only content-verified caches.
+) -> tuple[np.ndarray, dict]:
+    """Encode UTF-8 chunks into packed in-memory IDs without writing files.
 
-    encode_iterable preserves pre-token and special-token boundaries
-    across file reads. No marker or newline normalization is added.
+    Rust preserves pre-token and special-token boundaries across reads.
+    Digests identify the data when resuming; they are computed while encoding.
     """
+    # read(0) loses the corpus; read(-1) loads it all instead of streaming.
     if chunk_chars <= 0:
         raise ValueError("chunk_chars must be positive")
-    identity = tokenizer_identity(tokenizer)
+    started = time.perf_counter()
     dtype = np.dtype("<u2" if len(tokenizer.vocab) <= 65536 else "<u4")
-    metadata = {
-        "format_version": 1,
-        "text_sha256": file_digest(text_path),
-        "tokenizer": identity,
+    storage = bytearray()
+    text_digest = hashlib.sha256()
+    tokens_digest = hashlib.sha256()
+    with text_path.open(encoding="utf-8", newline="") as stream:
+
+        def chunks():
+            while chunk := stream.read(chunk_chars):
+                text_digest.update(chunk.encode("utf-8"))
+                yield chunk
+
+        for block in tokenizer.encode_blocks(chunks(), dtype.str):
+            storage.extend(block)
+            tokens_digest.update(block)
+    # NumPy borrows the packed buffer instead of copying the entire corpus.
+    tokens = np.frombuffer(storage, dtype=dtype)
+    seconds = time.perf_counter() - started
+    logger.info(
+        "Encoded %s: %d tokens in %.2fs", text_path.name, len(tokens), seconds
+    )
+    return tokens, {
         "dtype": dtype.str,
+        "text_sha256": text_digest.hexdigest(),
+        "tokens_sha256": tokens_digest.hexdigest(),
+        "token_count": len(tokens),
+        "encoding_seconds": seconds,
     }
-    key = hashlib.sha256(
-        json.dumps(metadata, sort_keys=True).encode()
-    ).hexdigest()
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    binary = cache_dir / f"{key}.bin"
-    manifest = cache_dir / f"{key}.json"
-    reused = False
-    if binary.is_file() and manifest.is_file():
-        try:
-            saved = json.loads(manifest.read_text())
-            reused = (
-                all(saved.get(k) == v for k, v in metadata.items())
-                and saved.get("token_count", 0) >= 2
-                and binary.stat().st_size
-                == saved["token_count"] * dtype.itemsize
-                and file_digest(binary) == saved["tokens_sha256"]
-            )
-        except (ValueError, KeyError, TypeError):
-            reused = False
-    if not reused:
-        with tempfile.NamedTemporaryFile(dir=cache_dir, delete=False) as output:
-            temporary = Path(output.name)
-            digest = hashlib.sha256()
-            count = 0
-            try:
-                with text_path.open(encoding="utf-8", newline="") as stream:
-                    chunks = iter(lambda: stream.read(chunk_chars), "")
-                    ids = tokenizer.encode_iterable(chunks)
-                    while values := list(itertools.islice(ids, 65536)):
-                        if min(values) < 0 or max(values) >= len(
-                            tokenizer.vocab
-                        ):
-                            raise ValueError(
-                                "BPE returned an out-of-vocabulary ID"
-                            )
-                        block = np.asarray(values, dtype=dtype).tobytes()
-                        output.write(block)
-                        digest.update(block)
-                        count += len(values)
-                if count < 2:
-                    raise ValueError("text must encode to at least two tokens")
-                if file_digest(text_path) != metadata["text_sha256"]:
-                    raise ValueError("raw text changed during tokenization")
-            except BaseException:
-                temporary.unlink(missing_ok=True)
-                raise
-        saved = dict(
-            metadata, token_count=count, tokens_sha256=digest.hexdigest()
-        )
-        temporary.replace(binary)
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=cache_dir, delete=False
-        ) as output:
-            json.dump(saved, output, ensure_ascii=False, indent=2)
-            temp_manifest = Path(output.name)
-        temp_manifest.replace(manifest)
-    tokens = np.memmap(
-        binary, dtype=dtype, mode="r", shape=(saved["token_count"],)
-    )
-    return tokens, dict(
-        saved, cache_file=str(binary.resolve()), cache_reused=reused
-    )
 
 
 def sample_batch(tokens, context_length, batch_size, generator, device):

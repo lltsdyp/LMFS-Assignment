@@ -13,8 +13,6 @@ def compute_dtype(x: Tensor) -> torch.dtype:
 
 def check_same_device(*tensors: Tensor) -> None:
     """Require inputs on one device without selecting an execution backend."""
-    if not tensors:
-        raise ValueError("at least one tensor is required")
     device = tensors[0].device
     if any(tensor.device != device for tensor in tensors[1:]):
         raise ValueError("all inputs must be on the same device")

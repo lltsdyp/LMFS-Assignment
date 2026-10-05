@@ -4,8 +4,9 @@ version = "0.1.0"
 description = "LMFS Assignment 1: BPE and Transformer"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "lmfs-bpe-native",
     "numpy",
-    "regex",
+    "regex==2026.9.10",
     "torch",
     "wandb==0.30.0",
     "pytest",
@@ -24,9 +25,15 @@ target-version = ["py313"]
 [tool.pylint.format]
 max-line-length = 80
 
+[tool.pylint.main]
+extension-pkg-allow-list = ["_lmfs_bpe"]
+
 [tool.uv]
 package = false
 python-preference = "managed"
+
+[tool.uv.sources]
+lmfs-bpe-native = { path = "rust", editable = true }
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

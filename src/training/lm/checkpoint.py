@@ -26,10 +26,6 @@ def load_checkpoint(path: Path) -> dict:
     if saved.get("format_version") != 1:
         raise ValueError("unsupported language-model checkpoint format")
     timing_path = path.with_suffix(path.suffix + ".json")
-    if not timing_path.is_file():
-        raise ValueError(
-            "keep the checkpoint.pt.json timing file with the checkpoint"
-        )
     timing = json.loads(timing_path.read_text())
     if (
         timing["run_id"] != saved["run_id"]

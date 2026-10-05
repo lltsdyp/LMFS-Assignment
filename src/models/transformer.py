@@ -78,8 +78,8 @@ class TransformerLM(nn.Module):
         dtype=None,
     ):
         super().__init__()
-        if context_length <= 0 or num_layers <= 0:
-            raise ValueError("context_length and num_layers must be positive")
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
         d_ff = default_ffn_dim(d_model) if d_ff is None else d_ff
         self.config = TransformerConfig(
             vocab_size,

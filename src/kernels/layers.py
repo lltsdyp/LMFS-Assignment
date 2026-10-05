@@ -58,8 +58,8 @@ class RMSNorm(nn.Module):
 
     def __init__(self, d_model, eps=1e-5, device=None, dtype=None):
         super().__init__()
-        if d_model <= 0 or eps <= 0:
-            raise ValueError("d_model and eps must be positive")
+        if d_model <= 0:
+            raise ValueError("d_model must be positive")
         self.d_model = d_model
         self.eps = eps
         self.weight = nn.Parameter(

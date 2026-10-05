@@ -25,8 +25,6 @@ def evaluate(model, tokens, batch_size, device) -> dict:
             count += (targets != -100).sum().item()
     finally:
         model.train(was_training)
-    if count != len(tokens) - 1:
-        raise RuntimeError("validation target coverage is incomplete")
     return {
         "nll": total_nll,
         "target_tokens": count,

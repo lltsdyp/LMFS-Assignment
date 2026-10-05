@@ -275,6 +275,7 @@ name = "lmfs-assignment1"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "lmfs-bpe-native" },
     { name = "numpy" },
     { name = "pytest" },
     { name = "regex" },
@@ -290,9 +291,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "lmfs-bpe-native", editable = "rust" },
     { name = "numpy" },
     { name = "pytest" },
-    { name = "regex" },
+    { name = "regex", specifier = "==2026.9.10" },
     { name = "torch" },
     { name = "wandb", specifier = "==0.30.0" },
 ]
@@ -302,6 +304,11 @@ dev = [
     { name = "black" },
     { name = "pylint" },
 ]
+
+[[package]]
+name = "lmfs-bpe-native"
+version = "0.1.0"
+source = { editable = "rust" }
 
 [[package]]
 name = "markupsafe"

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 
-from src.utils import pretokenization
-
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class EncodingIndexes:
@@ -39,10 +37,8 @@ def build_encoding_indexes(
     Returns:
         Vocabulary, merge-rank, and special-token lookup tables.
 
-    Raises:
-        ValueError: If a special token is empty or is not a string.
+    Special tokens are checked when the caller constructs its PreTokenizer.
     """
-    pretokenization.validate_special_tokens(special_tokens)
     token_to_id = {token: token_id for token_id, token in vocab.items()}
     merge_ranks = {}
     for rank, pair in enumerate(merges):

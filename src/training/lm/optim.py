@@ -23,7 +23,6 @@ def _adamw_update_(
     weight_decay: float,
 ) -> None:
     """Update a parameter in place; AdamW manages state and step counts."""
-    check_same_device(parameter, grad, exp_avg, exp_avg_sq)
     beta1, beta2 = betas
     grad = grad.to(exp_avg.dtype)
     parameter.mul_(1 - lr * weight_decay)
@@ -74,29 +73,28 @@ class AdamW(torch.optim.Optimizer):
     def __init__(
         self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01
     ):
-        self._validate(lr, betas, eps, weight_decay)
         super().__init__(
             params,
             dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay),
         )
+        # Check final group values once, including any per-group overrides.
+        # Invalid beta/epsilon values break the update's divisions; nonfinite
+        # hyperparameters would corrupt parameters and moment state.
         for group in self.param_groups:
-            self._validate(
+            lr, betas, eps, weight_decay = (
                 group["lr"],
                 group["betas"],
                 group["eps"],
                 group["weight_decay"],
             )
-
-    @staticmethod
-    def _validate(lr, betas, eps, weight_decay):
-        if not math.isfinite(lr) or lr < 0:
-            raise ValueError("lr must be finite and nonnegative")
-        if len(betas) != 2 or not all(0 <= beta < 1 for beta in betas):
-            raise ValueError("betas must contain two values in [0, 1)")
-        if not math.isfinite(eps) or eps <= 0:
-            raise ValueError("eps must be finite and positive")
-        if not math.isfinite(weight_decay) or weight_decay < 0:
-            raise ValueError("weight_decay must be finite and nonnegative")
+            if not math.isfinite(lr) or lr < 0:
+                raise ValueError("lr must be finite and nonnegative")
+            if len(betas) != 2 or not all(0 <= beta < 1 for beta in betas):
+                raise ValueError("betas must contain two values in [0, 1)")
+            if not math.isfinite(eps) or eps <= 0:
+                raise ValueError("eps must be finite and positive")
+            if not math.isfinite(weight_decay) or weight_decay < 0:
+                raise ValueError("weight_decay must be finite and nonnegative")
 
     def load_state_dict(self, state_dict):
         """Restore float32 moments without casting them through half precision."""
@@ -190,9 +188,7 @@ def cosine_learning_rate(
     if step > cosine_steps:
         return min_lr
     progress = (step - warmup_steps) / (cosine_steps - warmup_steps)
-    return min_lr + 0.5 * (1 + math.cos(math.pi * progress)) * (
-        max_lr - min_lr
-    )
+    return min_lr + 0.5 * (1 + math.cos(math.pi * progress)) * (max_lr - min_lr)
 
 
 @torch.no_grad()

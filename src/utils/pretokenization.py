@@ -20,12 +20,6 @@ _PRETOKENIZER = regex.compile(PAT)
 _END_OF_INPUT = object()
 
 
-def validate_special_tokens(special_tokens: list[str]) -> None:
-    """Rejects special tokens that are empty or are not strings."""
-    if any(not isinstance(token, str) or not token for token in special_tokens):
-        raise ValueError("special tokens must be non-empty strings")
-
-
 def pretokenize(text: str) -> Iterator[str]:
     """Splits ordinary text into GPT-2 pre-tokens without changing its contents.
 
@@ -38,8 +32,6 @@ def pretokenize(text: str) -> Iterator[str]:
     Raises:
         TypeError: If text is not a string.
     """
-    if not isinstance(text, str):
-        raise TypeError("text must be a string")
     return (match.group(0) for match in _PRETOKENIZER.finditer(text))
 
 
@@ -47,7 +39,9 @@ class PreTokenizer:
     """Shares literal marker recognition and ordinary pre-token boundaries."""
 
     def __init__(self, special_tokens: list[str]) -> None:
-        validate_special_tokens(special_tokens)
+        # Empty markers would match every position and break text boundaries.
+        if "" in special_tokens:
+            raise ValueError("special tokens must be non-empty strings")
         ordered_tokens = sorted(special_tokens, key=len, reverse=True)
         self._special_pattern = (
             regex.compile("|".join(regex.escape(t) for t in ordered_tokens))
@@ -68,8 +62,6 @@ class PreTokenizer:
         Raises:
             TypeError: If text is not a string.
         """
-        if not isinstance(text, str):
-            raise TypeError("text must be a string")
         start = 0
         for match in self._iter_special_matches(text):
             yield from self._iter_ordinary(text, start, match.start())

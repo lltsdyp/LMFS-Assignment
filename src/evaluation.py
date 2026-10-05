@@ -75,8 +75,6 @@ def token_rows(
     offset = 0
     for position, token_id in enumerate(ids):
         piece = tokenizer.vocab[token_id]
-        if not isinstance(piece, bytes):
-            raise TypeError("vocab values must be bytes")
         end = offset + len(piece)
         try:
             piece.decode("utf-8", errors="strict")

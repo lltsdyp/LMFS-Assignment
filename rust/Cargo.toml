@@ -1,0 +1,20 @@
+[package]
+name = "lmfs-bpe-native"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "_lmfs_bpe"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py313"] }
+rayon = "1.12"
+# Literal special-token matching only; classification uses Unicode 17 below.
+regex = { version = "=1.13.1", default-features = false, features = ["std", "perf"] }
+unicode-properties = { version = "=0.1.4", default-features = false, features = ["general-category"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

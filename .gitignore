@@ -10,3 +10,7 @@ __pycache__/
 
 outputs/
 wandb/
+
+rust/target/
+
+*.so

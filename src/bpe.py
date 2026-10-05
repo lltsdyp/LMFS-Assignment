@@ -1,8 +1,10 @@
 """Trains, encodes, and decodes text with a byte-level BPE tokenizer.
 
 BPE owns vocabulary construction and the incremental merge loop. Training data
-structures and pair helpers live in training.bpe. Text and encoding helpers
-live in utils.pretokenization and utils.encoding. BPE owns the encoding flow,
+structures and pair helpers live in training.bpe. Text and streaming encoding
+reference helpers live in utils.pretokenization. Encoding sends whole text
+blocks to the Rust extension, which owns Unicode splitting and streaming tails.
+BPE owns the encoding flow,
 model lookups, cache, byte decoding, and model persistence. utils.serializer
 handles pickle file operations. utils.indexes builds encoding lookup tables
 from model data.
@@ -16,9 +18,10 @@ import logging
 import os
 import pathlib
 
+from _lmfs_bpe import NativeBPE
+
 from src.training.bpe import pairs
 from src.training.bpe import words
-from src.utils import encoding
 from src.utils import indexes
 from src.utils import pretokenization
 from src.utils import serializer
@@ -71,7 +74,7 @@ class BPE:
         self._merge_ranks: dict[Merge, int] = {}
         self._special_token_ids: dict[str, int] = {}
         self._pretokenizer: pretokenization.PreTokenizer
-        self._encoding_cache: dict[bytes, tuple[int, ...]] = {}
+        self._native_encoder: NativeBPE
         self._rebuild_indexes()
 
     def train(
@@ -94,17 +97,18 @@ class BPE:
 
         Raises:
             ValueError: If the vocabulary is too small or a special token is
-                invalid.
+                empty.
+            TypeError: If a special token is not a string.
         """
         # Keep vocabulary initialization and merging in one training flow.
         # pylint: disable=too-many-locals,too-many-branches
-        pretokenization.validate_special_tokens(special_tokens)
         if len(special_tokens) != len(set(special_tokens)):
             logger.warning(
                 "Duplicate special tokens were provided; "
                 "keeping their first occurrence."
             )
             special_tokens = list(dict.fromkeys(special_tokens))
+        training_pretokenizer = pretokenization.PreTokenizer(special_tokens)
         minimum_vocab_size = _BASE_VOCAB_SIZE + len(special_tokens)
         logger.info("Initial vocab size=%d", minimum_vocab_size)
         if vocab_size < minimum_vocab_size:
@@ -126,7 +130,7 @@ class BPE:
         if len(vocab) < vocab_size:
             training_words = words.TrainingWords.from_file(
                 input_path,
-                pretokenizer=pretokenization.PreTokenizer(special_tokens),
+                pretokenizer=training_pretokenizer,
             )
             logger.info("Read corpus file done.")
             states = pairs.initialize_pair_states(training_words)
@@ -176,7 +180,7 @@ class BPE:
         self.vocab = vocab
         self.merges = merges
         self.special_tokens = list(special_tokens)
-        self._rebuild_indexes()
+        self._rebuild_indexes(training_pretokenizer)
 
     def encode(self, text: str) -> list[int]:
         """Encodes text into token IDs, retaining literal special tokens.
@@ -191,20 +195,7 @@ class BPE:
             TypeError: If text is not a string.
             KeyError: If the vocabulary lacks a required byte or merge token.
         """
-        ids: list[int] = []
-        for word, is_special in self._pretokenizer.iter_text(text):
-            if is_special:
-                ids.append(self._special_token_ids[word.decode("utf-8")])
-            else:
-                ids.extend(
-                    encoding.encode_word(
-                        word,
-                        self._token_to_id,
-                        self._merge_ranks,
-                        self._encoding_cache,
-                    )
-                )
-        return ids
+        return self._native_encoder.encode_text(text)
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         """Yields IDs lazily, preserving boundaries across text chunks.
@@ -215,17 +206,35 @@ class BPE:
 
         Yields:
             The same IDs as encode() on the concatenated input strings.
+            Rust retains incomplete pre-tokens and special markers across
+            chunks, yielding each chunk's safe prefix in input order.
         """
-        for word, is_special in self._pretokenizer.iter_chunks(iterable):
-            if is_special:
-                yield self._special_token_ids[word.decode("utf-8")]
-            else:
-                yield from encoding.encode_word(
-                    word,
-                    self._token_to_id,
-                    self._merge_ranks,
-                    self._encoding_cache,
-                )
+        stream = self._native_encoder.stream()
+        for chunk in iterable:
+            yield from stream.push(chunk)
+        yield from stream.push("", final_chunk=True)
+
+    def encode_blocks(
+        self, iterable: Iterable[str], dtype: str = "uint16"
+    ) -> Iterator[bytes]:
+        """Yields packed little-endian token blocks for bulk processing.
+
+        Chunks form one continuous text, as in encode_iterable(). Rust does
+        pre-tokenization, merging and packing while releasing the GIL. Each
+        nonempty bytes block can be written or viewed with numpy.frombuffer
+        without constructing Python objects for its individual token IDs.
+
+        All vocabulary IDs must fit the requested uint16 or uint32 dtype.
+        Incomplete pre-tokens may require retaining more than one input chunk.
+        """
+        stream = self._native_encoder.stream(dtype=dtype)
+        for chunk in iterable:
+            block = stream.push_bytes(chunk)
+            if block:
+                yield block
+        block = stream.push_bytes("", final_chunk=True)
+        if block:
+            yield block
 
     def decode(self, ids: Iterable[int]) -> str:
         """Decodes joined token bytes as UTF-8, retaining special tokens.
@@ -301,16 +310,24 @@ class BPE:
             special_tokens=special_tokens,
         )
 
-    def _rebuild_indexes(self) -> None:
+    def _rebuild_indexes(
+        self, pretokenizer: pretokenization.PreTokenizer | None = None
+    ) -> None:
         """Rebuilds inference lookups and clears the old encoding cache."""
+        self._pretokenizer = pretokenizer or pretokenization.PreTokenizer(
+            self.special_tokens
+        )
         lookup_tables = indexes.build_encoding_indexes(
             self.vocab, self.merges, self.special_tokens
         )
         self._token_to_id = lookup_tables.token_to_id
         self._merge_ranks = lookup_tables.merge_ranks
         self._special_token_ids = lookup_tables.special_token_ids
-        self._pretokenizer = pretokenization.PreTokenizer(self.special_tokens)
-        self._encoding_cache.clear()
+        self._native_encoder = NativeBPE(
+            self._token_to_id,
+            self.merges,
+            self.special_tokens,
+        )
 
 
 def get_tokenizer(

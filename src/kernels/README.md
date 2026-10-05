@@ -126,15 +126,15 @@ RoPE 缓存在转换模型 dtype 后仍保留至少 float32 精度，随模型�
 import torch
 from src.bpe import BPE
 from src.models import TransformerLM
+from src.training.lm.data import tokenizer_identity
 from src.utils.losses import cross_entropy
 
 bpe = BPE()
 bpe.load("tokenizer.pkl")  # 使用任务一实际输出的完整文件路径
-if sorted(bpe.vocab) != list(range(len(bpe.vocab))):
-    raise ValueError("词表 ID 必须从 0 连续编号")
+identity = tokenizer_identity(bpe)
 
 model = TransformerLM(
-    vocab_size=len(bpe.vocab),
+    vocab_size=identity["vocab_size"],
     context_length=256,
     d_model=512,
     num_layers=4,
@@ -145,8 +145,6 @@ model = TransformerLM(
 # 此处仅演示接口；正式数据采样由 src.training.lm.data 负责。
 # 不额外插入 BOS/EOS，已有特殊 token 由任务一编码逻辑处理。
 ids = bpe.encode("Hello, Transformer! This is a training example.")
-if len(ids) < 2:
-    raise ValueError("示例文本至少需要两个 token")
 tokens = torch.tensor(ids[:257], dtype=torch.long).unsqueeze(0)
 x, targets = tokens[:, :-1], tokens[:, 1:]
 logits = model(x)  # (1, sequence_length, len(bpe.vocab))
@@ -223,7 +221,7 @@ closure、`zero_grad()` 和状态保存恢复。float16/bfloat16 参数的动量
 验证 PPL 的汇总方式：
 
 ```python
-import math
+from src.utils.metrics import perplexity
 
 model.eval()
 total_nll = 0.0
@@ -236,9 +234,7 @@ with torch.no_grad():
         ).item()
         total_targets += (valid_targets != -100).sum().item()
 
-if total_targets == 0:
-    raise ValueError("验证集没有有效目标 token")
-ppl = math.exp(total_nll / total_targets)
+ppl = perplexity(total_nll, total_targets)
 model.train()
 ```
 
