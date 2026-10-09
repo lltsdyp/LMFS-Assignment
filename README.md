@@ -22,6 +22,16 @@ from src.utils.losses import cross_entropy
 [kernels 使用文档](src/kernels/README.md)。语言模型训练入口已实现，见
 [训练、验证和续训说明](src/training/lm/README.md)。
 
+## 下载 TinyStories
+
+在项目根目录执行，下载 TinyStories V2 GPT-4 训练集和验证集到 `data/`：
+
+```bash
+bash download_tinystories.sh
+```
+
+使用 `wget -c`，中断后可再次运行以继续下载。
+
 ## 语言模型训练
 
 默认模型：context length 256、d_model 512、d_ff 1344、RoPE θ 10000、4 层、16 头。

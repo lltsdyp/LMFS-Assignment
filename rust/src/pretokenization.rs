@@ -131,7 +131,13 @@ impl PreTokenizer {
             .saturating_sub(self.special_width.saturating_sub(1));
         let eligible_end = out.len().saturating_sub(2).max(ordinary_start);
         let keep = (ordinary_start..eligible_end)
-            .find(|&i| out[i].end.saturating_add(1) >= safe_end)
+            .find(|&i| {
+                // Whitespace lookahead needs the entire next Unicode scalar,
+                // while span offsets and the marker tail limit are byte offsets.
+                let next_end =
+                    out[i].end + text[out[i].end..].chars().next().map_or(0, char::len_utf8);
+                next_end >= safe_end
+            })
             .unwrap_or(eligible_end);
         out.truncate(keep);
         let consumed = out.last().map_or(segment_start, |span| span.end);
