@@ -10,7 +10,7 @@ from src.utils.metrics import perplexity
 
 
 @torch.no_grad()
-def evaluate(model, tokens, batch_size, device) -> dict:
+def evaluate(model, tokens, batch_size, device, *, autocast_dtype=None) -> dict:
     """Evaluate every real next-token target and restore the caller's mode."""
     started = time.perf_counter()
     was_training = model.training
@@ -20,7 +20,13 @@ def evaluate(model, tokens, batch_size, device) -> dict:
         for inputs, targets in validation_batches(
             tokens, model.config.context_length, batch_size, device
         ):
-            nll = cross_entropy(model(inputs), targets, reduction="none")
+            with torch.autocast(
+                device_type=torch.device(device).type,
+                dtype=autocast_dtype,
+                enabled=autocast_dtype is not None,
+            ):
+                logits = model(inputs)
+            nll = cross_entropy(logits, targets, reduction="none")
             total_nll += nll.to(torch.float64).sum().item()
             count += (targets != -100).sum().item()
     finally:

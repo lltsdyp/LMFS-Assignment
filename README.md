@@ -54,6 +54,21 @@ uv run python -m src.train_lm \
 缓存准备、A100 运行、预算预留和 checkpoint 续训命令见
 [训练说明](src/training/lm/README.md)。
 
+通用训练入口还支持以下选项：
+
+- `--gradient-accumulation N`（默认 1）：`--batch-size` 指 micro batch size，
+  有效 batch size 为两者的乘积。累积后才裁剪梯度并执行一次 optimizer 更新；
+  `--max-steps`、warmup/cosine、验证和保存间隔都按优化更新计数。
+- `--autocast-dtype bfloat16`：启用可选混合精度。配合默认的
+  `--dtype float32`，参数、参数梯度和 AdamW 状态保持 float32，前向使用
+  BF16 autocast，交叉熵使用 float32 计算。默认 `none` 表示关闭混合精度。
+- `--compile-model`：使用 `torch.compile` 编译现有手写模型，默认关闭。
+
+训练配置记录有效 batch size 和每次优化更新的 token 数；训练及验证日志
+直接记录平均 next-token loss（`mean_nll`）。定期验证和最终验证均覆盖完整验证集。
+续训恢复混合精度配置；仅评估已有 float32 模型时，可用 `--eval-only`、
+`--resume` 和 `--autocast-dtype none` 关闭混合精度进行对照评估。
+
 ## 安装依赖
 
 需要 Python 3.13、uv 和 Rust 工具链（Cargo/rustc）。在项目根目录执行：

@@ -53,6 +53,7 @@ _MODEL_DEFAULTS = dict(
 )
 _TRAIN_DEFAULTS = dict(
     batch_size=1,
+    gradient_accumulation=1,
     max_lr=3e-4,
     min_lr=3e-5,
     betas=[0.9, 0.95],
@@ -63,6 +64,7 @@ _TRAIN_DEFAULTS = dict(
     cosine_steps=20000,
     seed=42,
     dtype="float32",
+    autocast_dtype="none",
 )
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,10 @@ def parse_args(argv=None):
             parser.add_argument("--betas", nargs=2, type=float)
         elif name == "dtype":
             parser.add_argument("--dtype", choices=["float32", "bfloat16"])
+        elif name == "autocast_dtype":
+            parser.add_argument(
+                "--autocast-dtype", choices=["none", "bfloat16"]
+            )
         else:
             parser.add_argument(
                 "--" + name.replace("_", "-"),
@@ -113,6 +119,11 @@ def parse_args(argv=None):
         help="absolute final update count, including resumed steps; default run until time limit",
     )
     parser.add_argument("--eval-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help="compile handwritten forward/backward with torch.compile",
+    )
     parser.add_argument(
         "--eval-every",
         type=int,
@@ -146,6 +157,12 @@ def parse_args(argv=None):
         parser.error("--max-steps must be nonnegative")
     if args.eval_every < 0 or args.save_every < 0:
         parser.error("intervals must be nonnegative")
+    if args.eval_batch_size <= 0:
+        parser.error("eval batch size must be positive")
+    for name in ("batch_size", "gradient_accumulation"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"{name} must be positive")
     if (
         not math.isfinite(args.time_budget_seconds)
         or not math.isfinite(args.finalize_reserve_seconds)
@@ -176,7 +193,12 @@ def _options(args, saved, identity):
     for key in _TRAIN_DEFAULTS:
         value = getattr(args, key)
         if value is not None:
-            if saved and key in ("dtype", "seed") and value != training[key]:
+            if (
+                saved
+                and key in ("dtype", "seed", "autocast_dtype")
+                and value != training[key]
+                and not (args.eval_only and key == "autocast_dtype")
+            ):
                 raise ValueError(f"cannot change {key} when resuming")
             training[key] = value
     return model, training
@@ -243,6 +265,10 @@ def main(argv=None, *, started_at=None):
     tokenizer.load(tokenizer_file)
     identity = tokenizer_identity(tokenizer)
     model_config, training = _options(args, saved, identity)
+    if training["batch_size"] <= 0 or training["gradient_accumulation"] <= 0:
+        raise ValueError(
+            "batch size and gradient accumulation must be positive"
+        )
     train_file = args.train_file or (
         Path(saved["raw_paths"]["train"]) if saved else _DATA / "owt_train.txt"
     )
@@ -294,6 +320,10 @@ def main(argv=None, *, started_at=None):
     generator = torch.Generator().manual_seed(training["seed"])
     dtype = getattr(torch, training["dtype"])
     model = TransformerLM(**model_config, device=device, dtype=dtype)
+    autocast_dtype = (
+        torch.bfloat16 if training["autocast_dtype"] == "bfloat16" else None
+    )
+    config["compile_model"] = args.compile_model
     optimizer = AdamW(
         model.parameters(),
         lr=training["max_lr"],
@@ -317,10 +347,18 @@ def main(argv=None, *, started_at=None):
         step, prior_seconds = saved["step"], saved["consumed_seconds"]
         window = dict(saved["train_window"])
     config["parameter_count"] = sum(p.numel() for p in model.parameters())
+    config["effective_batch_size"] = (
+        training["batch_size"] * training["gradient_accumulation"]
+    )
+    config["tokens_per_step"] = (
+        config["effective_batch_size"] * model.config.context_length
+    )
     config["resumed_from"] = str(args.resume.resolve()) if saved else None
     config["prior_seconds"] = prior_seconds
     # Model/optimizer state is copied by the loaders; release large CPU payloads.
     saved = None
+    if args.compile_model:
+        model.compile()
     write_json(output / "config.json", config)
     logger.info(
         "%d parameters; step %d; device %s",
@@ -375,6 +413,7 @@ def main(argv=None, *, started_at=None):
                     kind="train",
                     step=step,
                     lr=lr,
+                    mean_nll=window["nll"] / window["tokens"],
                     ppl=perplexity(window["nll"], window["tokens"]),
                     wall_seconds=elapsed(),
                 )
@@ -436,36 +475,56 @@ def main(argv=None, *, started_at=None):
                 )
                 for group in optimizer.param_groups:
                     group["lr"] = lr
-                inputs, targets = sample_batch(
-                    train_tokens,
-                    model.config.context_length,
-                    training["batch_size"],
-                    generator,
-                    device,
-                )
                 optimizer.zero_grad(set_to_none=True)
-                nll = cross_entropy(model(inputs), targets, reduction="sum")
-                value = nll.item()
-                if not math.isfinite(value):
-                    raise ValueError("training NLL is nonfinite")
-                (nll / targets.numel()).backward()
+                update_nll, update_tokens = 0.0, 0
+                for _ in range(training["gradient_accumulation"]):
+                    inputs, targets = sample_batch(
+                        train_tokens,
+                        model.config.context_length,
+                        training["batch_size"],
+                        generator,
+                        device,
+                    )
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=autocast_dtype,
+                        enabled=autocast_dtype is not None,
+                    ):
+                        logits = model(inputs)
+                    nll = cross_entropy(logits, targets, reduction="sum")
+                    value = nll.item()
+                    if not math.isfinite(value):
+                        raise ValueError("training NLL is nonfinite")
+                    # Equal-size micro batches: average over the entire update.
+                    (
+                        nll
+                        / (targets.numel() * training["gradient_accumulation"])
+                    ).backward()
+                    update_nll += value
+                    update_tokens += targets.numel()
                 clip_grad_norm_(model.parameters(), training["max_grad_norm"])
                 optimizer.step()
                 step += 1
-                window["nll"] += value
-                window["tokens"] += targets.numel()
+                window["nll"] += update_nll
+                window["tokens"] += update_tokens
                 window["updates"] += 1
                 if step % 100 == 0:
                     flush_window(lr)
                 if args.eval_every and step % args.eval_every == 0:
                     validation = evaluate(
-                        model, valid_tokens, args.eval_batch_size, device
+                        model,
+                        valid_tokens,
+                        args.eval_batch_size,
+                        device,
+                        autocast_dtype=autocast_dtype,
                     )
                     record(
                         dict(
                             validation,
                             kind="valid",
                             step=step,
+                            mean_nll=validation["nll"]
+                            / validation["target_tokens"],
                             wall_seconds=elapsed(),
                         )
                     )
@@ -475,13 +534,19 @@ def main(argv=None, *, started_at=None):
             persist()
         # Validate the weights just saved; evaluation never updates them.
         final_validation = evaluate(
-            model, valid_tokens, args.eval_batch_size, device
+            model,
+            valid_tokens,
+            args.eval_batch_size,
+            device,
+            autocast_dtype=autocast_dtype,
         )
         record(
             dict(
                 final_validation,
                 kind="valid",
                 final=True,
+                mean_nll=final_validation["nll"]
+                / final_validation["target_tokens"],
                 step=step,
                 wall_seconds=elapsed(),
             )
