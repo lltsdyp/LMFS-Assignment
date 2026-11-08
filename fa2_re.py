@@ -17,6 +17,37 @@ def _operand_product(lhs, rhs, mode: tl.constexpr, acc=None):
         return tl.dot(lhs32, rhs32, acc, input_precision=mode)
 
 @triton.jit
+def _stage_padded_kernel(
+    q_src, k_src, v_src, q_dst, k_dst, v_dst,
+    sqh: tl.constexpr, sqr: tl.constexpr, sqd: tl.constexpr,
+    skh: tl.constexpr, skr: tl.constexpr, skd: tl.constexpr,
+    svh: tl.constexpr, svr: tl.constexpr, svd: tl.constexpr,
+    seq: tl.constexpr, dim: tl.constexpr, pitch: tl.constexpr,
+    col_block: tl.constexpr, row_block: tl.constexpr, copy_v: tl.constexpr,
+):
+    """Pack strided Q/K/V into half storage with explicit zero-filled padding."""
+    col = tl.arange(0, col_block)
+    row = tl.program_id(0) * row_block + tl.arange(0, row_block)
+    head = tl.program_id(1).to(tl.int64)
+    row_ok = row[:, None] < seq
+    read_ok = row_ok & (col[None, :] < dim)
+    write_ok = row_ok & (col[None, :] < pitch)
+    dst_offset = (head * seq + row[:, None]) * pitch + col[None, :]
+
+    q_ptrs = q_src + head * sqh + row[:, None] * sqr + col[None, :] * sqd
+    q_data = tl.load(q_ptrs, read_ok, other=0)
+    tl.store(q_dst + dst_offset, q_data.to(tl.float16), write_ok)
+
+    k_ptrs = k_src + head * skh + row[:, None] * skr + col[None, :] * skd
+    k_data = tl.load(k_ptrs, read_ok, other=0)
+    tl.store(k_dst + dst_offset, k_data.to(tl.float16), write_ok)
+
+    if copy_v:
+        v_ptrs = v_src + head * svh + row[:, None] * svr + col[None, :] * svd
+        v_data = tl.load(v_ptrs, read_ok, other=0)
+        tl.store(v_dst + dst_offset, v_data.to(tl.float16), write_ok)
+
+@triton.jit
 def _generic_forward_kernel(
     query_ptr,
     key_ptr,
@@ -419,12 +450,23 @@ class FlashAttention2(torch.autograd.Function):
         if query.device != key.device or query.device != value.device:
             raise ValueError("Q, K and V must share device")
         heads, seq, dim = query.shape
-        if seq % 32 or dim not in (16, 32, 64, 128):
-            raise ValueError("This version requires N divisible by 32 and D=16/32/64/128")
+        if not (heads > 0 and seq > 0 and 1 <= dim <= 256):
+            raise ValueError("Expected H/N > 0 and 1 <= D <= 256")
         output = torch.empty(query.shape, device=query.device, dtype=FlashAttention2.OUTPUT_DTYPE)
         partition = torch.empty((heads, seq), device=query.device, dtype=torch.float32)
         output_sum = torch.empty_like(partition)
-        q, k, v = query, key, value
+        padded = max(16, triton.next_power_of_2(dim))
+        staging = tuple(
+            torch.empty((heads, seq, padded), device=query.device, dtype=torch.float16)
+            for _ in range(3)
+        )
+        with torch.cuda.device(query.device):
+            _stage_padded_kernel[triton.cdiv(seq, 32), heads](
+                query, key, value, *staging,
+                *query.stride(), *key.stride(), *value.stride(),
+                seq, dim, padded, padded, 32, True, num_warps=4,
+            )
+        q, k, v = staging
         with torch.cuda.device(query.device):
             _generic_forward_kernel[triton.cdiv(seq, 32), heads](
                 q, k, v, output, partition, output_sum,
