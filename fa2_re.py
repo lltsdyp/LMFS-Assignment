@@ -17,6 +17,17 @@ def _operand_product(lhs, rhs, mode: tl.constexpr, acc=None):
         return tl.dot(lhs32, rhs32, acc, input_precision=mode)
 
 @triton.jit
+def _residual_product(lhs, rhs, total):
+    """Compute the low component first, then fold in the leading half."""
+    # Preparing rhs is independent of the hi/lo decomposition of lhs.
+    rhs16 = rhs.to(tl.float16)
+    hi = lhs.to(tl.float16)
+    lo = (lhs - hi.to(tl.float32)).to(tl.float16)
+    product = tl.dot(lo, rhs16)
+    product = tl.dot(hi, rhs16, product)
+    return total + product
+
+@triton.jit
 def _stage_padded_kernel(
     q_src, k_src, v_src, q_dst, k_dst, v_dst,
     sqh: tl.constexpr, sqr: tl.constexpr, sqd: tl.constexpr,
@@ -255,7 +266,7 @@ def _generic_query_gradient(
         other=0,
     )
     accumulator = tl.full((query_block, feature_block), 0, tl.float32)
-    probability_gain: tl.constexpr = 1.0
+    probability_gain: tl.constexpr = 1024.0 if precision_mode == "fp16" else 1.0
     for tile_index in range(tl.cdiv(sequence_length, key_block)):
         key_indices = tile_index * key_block + column_indices
         valid_transposed_elements = (feature_indices[:, None] < feature_count) & (
@@ -361,7 +372,7 @@ def _generic_key_value_gradient(
         other=0,
     )
     value_accumulator = tl.full((key_block, feature_block), 0, tl.float32)
-    probability_gain: tl.constexpr = 1.0
+    probability_gain: tl.constexpr = 1024.0 if precision_mode == "fp16" else 1.0
     for tile_index in range(tl.cdiv(sequence_length, query_block)):
         query_indices = tile_index * query_block + row_indices
         valid_transposed_elements = (feature_indices[:, None] < feature_count) & (
@@ -408,12 +419,17 @@ def _generic_key_value_gradient(
             * (probability_gradient - row_contraction[None, :])
             * probability_gain
         )
-        key_accumulator = _operand_product(
-            score_gradient,
-            tl.trans(transposed_queries),
-            precision_mode,
-            key_accumulator,
-        )
+        if precision_mode == "fp16":
+            key_accumulator = _residual_product(
+                score_gradient, tl.trans(transposed_queries), key_accumulator
+            )
+        else:
+            key_accumulator = _operand_product(
+                score_gradient,
+                tl.trans(transposed_queries),
+                precision_mode,
+                key_accumulator,
+            )
         value_accumulator = _operand_product(
             probabilities * probability_gain,
             tl.trans(transposed_upstream),
