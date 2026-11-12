@@ -196,6 +196,18 @@ def release_pool():
             cuda_driver.cuMemFree_v2(allocation_address)
     _managed_cache.clear()
 
+def _split_dim(padded_dim, max_part=128):
+    """Describe a padded feature axis with at most three MMA-sized pieces."""
+    pieces = []
+    remaining = padded_dim
+    for width in (128, 64, 32, 16):
+        if not (width <= max_part and remaining >= width):
+            continue
+        count, remaining = divmod(remaining, width)
+        pieces.extend([width] * count)
+    missing = 3 - len(pieces)
+    return tuple(pieces + [0] * missing)
+
 @triton.jit
 def _operand_product(lhs, rhs, mode: tl.constexpr, acc=None):
     """Convert the operands before issuing the requested dot-product variant."""
@@ -218,6 +230,47 @@ def _residual_product(lhs, rhs, total):
     product = tl.dot(lo, rhs16)
     product = tl.dot(hi, rhs16, product)
     return total + product
+
+@triton.jit
+def _read_feature_major(
+    src, row_ids, valid,
+    col0: tl.constexpr, width: tl.constexpr,
+    pitch: tl.constexpr, masked: tl.constexpr,
+):
+    """Present contiguous feature spans as the left axis of a loaded tile."""
+    cols = col0 + tl.arange(0, width)
+    row_offsets = row_ids[None, :] * pitch
+    ptrs = src + row_offsets + cols[:, None]
+    if masked:
+        return tl.load(ptrs, valid[None, :], other=0)
+    else:
+        return tl.load(ptrs)
+
+@triton.jit
+def _read_token_major(
+    src, row_ids, valid,
+    col0: tl.constexpr, width: tl.constexpr,
+    pitch: tl.constexpr, masked: tl.constexpr,
+):
+    """Load the same storage with token indices on the left axis."""
+    cols = col0 + tl.arange(0, width)
+    row_offsets = row_ids[:, None] * pitch
+    ptrs = src + row_offsets + cols[None, :]
+    if masked:
+        return tl.load(ptrs, valid[:, None], other=0)
+    else:
+        return tl.load(ptrs)
+
+@triton.jit
+def _write_feature_slice(
+    dst, row_ids, row_ok, data,
+    col0: tl.constexpr, width: tl.constexpr, actual_dim: tl.constexpr,
+):
+    """Exclude both trailing rows and padded columns from the write mask."""
+    cols = col0 + tl.arange(0, width)
+    mask = row_ok[:, None] & (cols[None, :] < actual_dim)
+    ptrs = dst + row_ids[:, None] * actual_dim + cols[None, :]
+    tl.store(ptrs, data, mask)
 
 @triton.jit
 def _stage_dense_kernel(
@@ -256,6 +309,384 @@ def _stage_dense_kernel(
             v_ptrs = v_src + head * svh + row * svr + col * svd
         v_data = tl.load(v_ptrs, valid, other=0)
         tl.store(v_dst + offset, v_data, valid)
+
+@triton.jit
+def _stage_padded_kernel(
+    q_src, k_src, v_src, q_dst, k_dst, v_dst,
+    sqh: tl.constexpr, sqr: tl.constexpr, sqd: tl.constexpr,
+    skh: tl.constexpr, skr: tl.constexpr, skd: tl.constexpr,
+    svh: tl.constexpr, svr: tl.constexpr, svd: tl.constexpr,
+    seq: tl.constexpr, dim: tl.constexpr, pitch: tl.constexpr,
+    col_block: tl.constexpr, row_block: tl.constexpr, copy_v: tl.constexpr,
+):
+    """Pack strided Q/K/V into half storage with explicit zero-filled padding."""
+    col = tl.arange(0, col_block)
+    row = tl.program_id(0) * row_block + tl.arange(0, row_block)
+    head = tl.program_id(1).to(tl.int64)
+    row_ok = row[:, None] < seq
+    read_ok = row_ok & (col[None, :] < dim)
+    write_ok = row_ok & (col[None, :] < pitch)
+    dst_offset = (head * seq + row[:, None]) * pitch + col[None, :]
+
+    q_ptrs = q_src + head * sqh + row[:, None] * sqr + col[None, :] * sqd
+    q_data = tl.load(q_ptrs, read_ok, other=0)
+    tl.store(q_dst + dst_offset, q_data.to(tl.float16), write_ok)
+
+    k_ptrs = k_src + head * skh + row[:, None] * skr + col[None, :] * skd
+    k_data = tl.load(k_ptrs, read_ok, other=0)
+    tl.store(k_dst + dst_offset, k_data.to(tl.float16), write_ok)
+
+    if copy_v:
+        v_ptrs = v_src + head * svh + row[:, None] * svr + col[None, :] * svd
+        v_data = tl.load(v_ptrs, read_ok, other=0)
+        tl.store(v_dst + dst_offset, v_data.to(tl.float16), write_ok)
+
+@triton.jit
+def _update_output_tile(
+    output_accumulator_0,
+    output_accumulator_1,
+    output_accumulator_2,
+    running_maximum,
+    running_mass,
+    query_slice_0,
+    query_slice_1,
+    query_slice_2,
+    key_base,
+    value_base,
+    key_indices,
+    sequence_length: tl.constexpr,
+    padded_features: tl.constexpr,
+    first_width: tl.constexpr,
+    second_width: tl.constexpr,
+    third_width: tl.constexpr,
+    score_scale: tl.constexpr,
+    mass_limit: tl.constexpr,
+    check_bounds: tl.constexpr,
+    defer_rescale: tl.constexpr,
+):
+    """Advance the output numerator and softmax state by one key tile."""
+    key_bounds = key_indices < sequence_length
+    key_slice_0 = _read_feature_major(
+        key_base, key_indices, key_bounds, 0, first_width, padded_features, check_bounds
+    )
+    score_product = tl.dot(query_slice_0, key_slice_0)
+    if second_width > 0:
+        key_slice_1 = _read_feature_major(
+            key_base,
+            key_indices,
+            key_bounds,
+            first_width,
+            second_width,
+            padded_features,
+            check_bounds,
+        )
+        score_product = tl.dot(query_slice_1, key_slice_1, score_product)
+    if third_width > 0:
+        key_slice_2 = _read_feature_major(
+            key_base,
+            key_indices,
+            key_bounds,
+            first_width + second_width,
+            third_width,
+            padded_features,
+            check_bounds,
+        )
+        score_product = tl.dot(query_slice_2, key_slice_2, score_product)
+    if check_bounds:
+        score_product = tl.where(key_bounds[None, :], score_product, -float("inf"))
+    if defer_rescale:
+        probabilities = tl.math.exp2(
+            score_product * score_scale - running_maximum[:, None]
+        )
+        tile_mass = tl.sum(probabilities, 1)
+        if tl.max(tile_mass, 0) > mass_limit:
+            next_maximum = tl.maximum(
+                running_maximum, tl.max(score_product, 1) * score_scale
+            )
+            rescale_factor = tl.math.exp2(running_maximum - next_maximum)
+            output_accumulator_0 = output_accumulator_0 * rescale_factor[:, None]
+            if second_width > 0:
+                output_accumulator_1 = output_accumulator_1 * rescale_factor[:, None]
+            if third_width > 0:
+                output_accumulator_2 = output_accumulator_2 * rescale_factor[:, None]
+            running_mass = running_mass * rescale_factor
+            running_maximum = next_maximum
+            probabilities = tl.math.exp2(
+                score_product * score_scale - running_maximum[:, None]
+            )
+            tile_mass = tl.sum(probabilities, 1)
+    else:
+        next_maximum = tl.maximum(
+            running_maximum, tl.max(score_product, 1) * score_scale
+        )
+        rescale_factor = tl.math.exp2(running_maximum - next_maximum)
+        output_accumulator_0 = output_accumulator_0 * rescale_factor[:, None]
+        if second_width > 0:
+            output_accumulator_1 = output_accumulator_1 * rescale_factor[:, None]
+        if third_width > 0:
+            output_accumulator_2 = output_accumulator_2 * rescale_factor[:, None]
+        running_mass = running_mass * rescale_factor
+        running_maximum = next_maximum
+        probabilities = tl.math.exp2(
+            score_product * score_scale - running_maximum[:, None]
+        )
+        tile_mass = tl.sum(probabilities, 1)
+    running_mass = running_mass + tile_mass
+    half_probabilities = probabilities.to(tl.float16)
+    value_slice_0 = _read_token_major(
+        value_base,
+        key_indices,
+        key_bounds,
+        0,
+        first_width,
+        padded_features,
+        check_bounds,
+    )
+    output_accumulator_0 = tl.dot(
+        half_probabilities, value_slice_0, output_accumulator_0
+    )
+    if second_width > 0:
+        value_slice_1 = _read_token_major(
+            value_base,
+            key_indices,
+            key_bounds,
+            first_width,
+            second_width,
+            padded_features,
+            check_bounds,
+        )
+        output_accumulator_1 = tl.dot(
+            half_probabilities, value_slice_1, output_accumulator_1
+        )
+    if third_width > 0:
+        value_slice_2 = _read_token_major(
+            value_base,
+            key_indices,
+            key_bounds,
+            first_width + second_width,
+            third_width,
+            padded_features,
+            check_bounds,
+        )
+        output_accumulator_2 = tl.dot(
+            half_probabilities, value_slice_2, output_accumulator_2
+        )
+    return (
+        output_accumulator_0,
+        output_accumulator_1,
+        output_accumulator_2,
+        running_maximum,
+        running_mass,
+    )
+
+@triton.jit
+def _packed_forward_kernel(
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    output_ptr,
+    log_partition_ptr,
+    output_sum_ptr,
+    sequence_length: tl.constexpr,
+    feature_count: tl.constexpr,
+    padded_features: tl.constexpr,
+    first_width: tl.constexpr,
+    second_width: tl.constexpr,
+    third_width: tl.constexpr,
+    query_block: tl.constexpr,
+    key_block: tl.constexpr,
+    score_scale: tl.constexpr,
+    mass_limit: tl.constexpr,
+):
+    """Produce output, log partition and rounded-output row sums."""
+    head_index = tl.program_id(1).to(tl.int64)
+    row_indices = tl.program_id(0) * query_block + tl.arange(0, query_block)
+    valid_rows = row_indices < sequence_length
+    head_base = head_index * sequence_length * padded_features
+    query_slice_0 = _read_token_major(
+        query_ptr + head_base,
+        row_indices,
+        valid_rows,
+        0,
+        first_width,
+        padded_features,
+        True,
+    )
+    output_accumulator_0 = tl.zeros([query_block, first_width], tl.float32)
+    if second_width > 0:
+        query_slice_1 = _read_token_major(
+            query_ptr + head_base,
+            row_indices,
+            valid_rows,
+            first_width,
+            second_width,
+            padded_features,
+            True,
+        )
+        output_accumulator_1 = tl.zeros([query_block, second_width], tl.float32)
+    else:
+        query_slice_1 = tl.zeros([1], tl.float16)
+        output_accumulator_1 = tl.zeros([1], tl.float32)
+    if third_width > 0:
+        query_slice_2 = _read_token_major(
+            query_ptr + head_base,
+            row_indices,
+            valid_rows,
+            first_width + second_width,
+            third_width,
+            padded_features,
+            True,
+        )
+        output_accumulator_2 = tl.zeros([query_block, third_width], tl.float32)
+    else:
+        query_slice_2 = tl.zeros([1], tl.float16)
+        output_accumulator_2 = tl.zeros([1], tl.float32)
+    running_maximum = tl.full([query_block], -float("inf"), tl.float32)
+    running_mass = tl.zeros([query_block], tl.float32)
+    key_base = key_ptr + head_base
+    value_base = value_ptr + head_base
+    column_indices = tl.arange(0, key_block)
+    complete_tiles: tl.constexpr = sequence_length // key_block
+    if complete_tiles > 0:
+        (
+            output_accumulator_0,
+            output_accumulator_1,
+            output_accumulator_2,
+            running_maximum,
+            running_mass,
+        ) = _update_output_tile(
+            output_accumulator_0,
+            output_accumulator_1,
+            output_accumulator_2,
+            running_maximum,
+            running_mass,
+            query_slice_0,
+            query_slice_1,
+            query_slice_2,
+            key_base,
+            value_base,
+            column_indices,
+            sequence_length,
+            padded_features,
+            first_width,
+            second_width,
+            third_width,
+            score_scale,
+            mass_limit,
+            False,
+            False,
+        )
+        for tile_index in range(1, complete_tiles):
+            (
+                output_accumulator_0,
+                output_accumulator_1,
+                output_accumulator_2,
+                running_maximum,
+                running_mass,
+            ) = _update_output_tile(
+                output_accumulator_0,
+                output_accumulator_1,
+                output_accumulator_2,
+                running_maximum,
+                running_mass,
+                query_slice_0,
+                query_slice_1,
+                query_slice_2,
+                key_base,
+                value_base,
+                tile_index * key_block + column_indices,
+                sequence_length,
+                padded_features,
+                first_width,
+                second_width,
+                third_width,
+                score_scale,
+                mass_limit,
+                False,
+                True,
+            )
+    if complete_tiles * key_block < sequence_length:
+        (
+            output_accumulator_0,
+            output_accumulator_1,
+            output_accumulator_2,
+            running_maximum,
+            running_mass,
+        ) = _update_output_tile(
+            output_accumulator_0,
+            output_accumulator_1,
+            output_accumulator_2,
+            running_maximum,
+            running_mass,
+            query_slice_0,
+            query_slice_1,
+            query_slice_2,
+            key_base,
+            value_base,
+            complete_tiles * key_block + column_indices,
+            sequence_length,
+            padded_features,
+            first_width,
+            second_width,
+            third_width,
+            score_scale,
+            mass_limit,
+            True,
+            False,
+        )
+    inverse_mass = 1.0 / running_mass
+    destination_ptr = output_ptr + head_index * sequence_length * feature_count
+    result_slice_0 = (output_accumulator_0 * inverse_mass[:, None]).to(
+        output_ptr.dtype.element_ty
+    )
+    output_row_sum = tl.sum(result_slice_0.to(tl.float32), 1)
+    _write_feature_slice(
+        destination_ptr,
+        row_indices,
+        valid_rows,
+        result_slice_0,
+        0,
+        first_width,
+        feature_count,
+    )
+    if second_width > 0:
+        result_slice_1 = (output_accumulator_1 * inverse_mass[:, None]).to(
+            output_ptr.dtype.element_ty
+        )
+        output_row_sum += tl.sum(result_slice_1.to(tl.float32), 1)
+        _write_feature_slice(
+            destination_ptr,
+            row_indices,
+            valid_rows,
+            result_slice_1,
+            first_width,
+            second_width,
+            feature_count,
+        )
+    if third_width > 0:
+        result_slice_2 = (output_accumulator_2 * inverse_mass[:, None]).to(
+            output_ptr.dtype.element_ty
+        )
+        output_row_sum += tl.sum(result_slice_2.to(tl.float32), 1)
+        _write_feature_slice(
+            destination_ptr,
+            row_indices,
+            valid_rows,
+            result_slice_2,
+            first_width + second_width,
+            third_width,
+            feature_count,
+        )
+    tl.store(
+        output_sum_ptr + head_index * sequence_length + row_indices,
+        output_row_sum,
+        valid_rows,
+    )
+    tl.store(
+        log_partition_ptr + head_index * sequence_length + row_indices,
+        running_maximum + tl.math.log2(running_mass),
+        valid_rows,
+    )
 
 @triton.jit
 def _generic_forward_kernel(
@@ -652,7 +1083,7 @@ def _generic_key_value_gradient(
     )
 
 class _WideHeadExecutor:
-    """Stage bounded head groups and keep large outputs in managed storage."""
+    """Dispatch the original wide-head path without changing its storage policy."""
 
     INPUT_DTYPE = torch.float32
     DOT_MODE = "fp16"
@@ -699,8 +1130,18 @@ class _WideHeadExecutor:
 
     @staticmethod
     def select_schedule(mode, dim, staged=True, seq=None):
-        """Use conservative tiles before shape-specific launch tuning."""
-        return (32, 32, 4, 1), (32, 32, 4, 1), (32, 32, 4, 1)
+        """Separate precision selection from the staging-dependent tile policy."""
+        if mode == "fp16":
+            if staged:
+                cfg = _WideHeadExecutor.FP16_LAUNCHES.get(
+                    dim, _WideHeadExecutor.FP16_LAUNCHES[128]
+                )
+                if dim == 128 and seq is not None and seq > 32768:
+                    return cfg[0], cfg[1], (64, 64, 4, 2)
+                return cfg
+            kv_stages = 2 if dim == 100 else 1
+            return (128, 32, 4, 2), (64, 64, 4, 1), (64, 64, 4, kv_stages)
+        return (64, 32, 4, 2), (32, 32, 4, 2), (32, 32, 4, 2)
 
     @staticmethod
     def compute_output(autograd_state, query, key, value):
@@ -962,19 +1403,262 @@ class _WideHeadExecutor:
         return (query_gradient, key_gradient, value_gradient)
 
 class FlashAttention2(torch.autograd.Function):
-    """Memory-bounded attention with a general dense-gradient backward."""
+    """Evaluator-compatible attention for equal-shaped CUDA [H, N, D] inputs.
+
+    Configuration names remain compatible. Selected launch schedules are
+    tuning candidates rather than validated improvements.
+    Both broadcast and general upstream gradients produce all three derivatives.
+    Inputs must use matching FP32/FP16/BF16 dtypes, H/N > 0 and 1 <= D <= 256;
+    these preconditions are not checked here.
+    """
 
     INPUT_DTYPE = torch.float32
     OUTPUT_DTYPE = torch.float16
+    DOT_MODE = "fp16"
+    USE_MANAGED_OUTPUT = True
+    MANAGED_TENSOR = "o"
+    HOST_ADVISE = False
+    HOST_POOL = False
+    PACK_HEADS = 8
+    PACK_BYTES = 2**30
+    SPLIT_D = True
+    LIMIT = 256.0
+    FAST_FWD = (128, 32, 4, 2)
+    FAST_FWD_SHORT = (128, 32, 4, 3)
+    FAST_DQ = (128, 32, 4, 3)
+    FAST_DKV = (64, 128, 8, 3, 1)
+    LONG_N = 32768
+    # Keep tile geometry fixed while trying shallower dQ pipelines at DP=128.
+    FAST_TABLE = {
+        (112, True): ((128, 32, 4, 2), (128, 32, 4, 3), (32, 128, 4, 4, 1)),
+        (128, False): ((128, 32, 4, 3), (128, 32, 4, 3), (64, 128, 8, 3, 1)),
+        (128, True): ((128, 32, 4, 2), (128, 32, 4, 2), (64, 128, 8, 3, 1)),
+    }
+    DKV_WIDEST = 64
 
     @staticmethod
-    def forward(ctx, query, key, value):
-        if query.shape != key.shape or query.shape != value.shape:
-            raise ValueError("Q, K and V must share shape")
-        if query.device != key.device or query.device != value.device:
-            raise ValueError("Q, K and V must share device")
-        return _WideHeadExecutor.compute_output(ctx, query, key, value)
+    def packed_layout(dim):
+        """Choose storage width separately from the two MMA decompositions."""
+        if FlashAttention2.SPLIT_D:
+            padded = -(-dim // 16) * 16
+        else:
+            padded = max(16, triton.next_power_of_2(dim))
+        out_parts = _split_dim(padded)
+        grad_parts = _split_dim(padded, FlashAttention2.DKV_WIDEST)
+        return padded, out_parts, grad_parts
 
     @staticmethod
-    def backward(ctx, upstream):
-        return _WideHeadExecutor.compute_gradients(ctx, upstream.contiguous())
+    def kernel_schedule(padded, seq):
+        """Use a shape-specific schedule when present, otherwise use the defaults."""
+        impl = FlashAttention2
+        long_seq = seq > impl.LONG_N
+        if long_seq:
+            fwd = impl.FAST_FWD
+        else:
+            fwd = impl.FAST_FWD_SHORT
+        fallback = fwd, impl.FAST_DQ, impl.FAST_DKV
+        return impl.FAST_TABLE.get((padded, long_seq), fallback)
+
+    @staticmethod
+    def stage_operands(
+        query, key, value, staging_storage, padded_width, include_values=True
+    ):
+        staged_head_count, token_count, head_width = query.shape
+        staged_query, staged_key, staged_value = (
+            item[:staged_head_count] for item in staging_storage
+        )
+        row_indices = 32
+        _stage_padded_kernel[triton.cdiv(token_count, row_indices), staged_head_count](
+            query,
+            key,
+            value,
+            staged_query,
+            staged_key,
+            staged_value,
+            *query.stride(),
+            *key.stride(),
+            *value.stride(),
+            token_count,
+            head_width,
+            padded_width,
+            triton.next_power_of_2(padded_width),
+            row_indices,
+            include_values,
+            num_warps=4,
+        )
+        return (staged_query, staged_key, staged_value)
+
+    @staticmethod
+    def forward(autograd_state, query, key, value):
+        head_count, token_count, head_width = query.shape
+        # Kernels address all three operands using the query shape and device.
+        if (
+            key.shape != query.shape
+            or value.shape != query.shape
+            or key.device != query.device
+            or value.device != query.device
+        ):
+            raise ValueError("Q, K and V must share shape and device")
+        autograd_state.uses_padded_operands = head_width <= 128
+        if not autograd_state.uses_padded_operands:
+            return _WideHeadExecutor.compute_output(autograd_state, query, key, value)
+        return FlashAttention2._forward_packed(
+            autograd_state, query, key, value, head_count, token_count, head_width
+        )
+
+    @staticmethod
+    def _forward_packed(
+        autograd_state, query, key, value, head_count, token_count, head_width
+    ):
+        padded_width, output_slices, gradient_slices = FlashAttention2.packed_layout(
+            head_width
+        )
+        output_schedule, query_schedule, key_value_schedule = (
+            FlashAttention2.kernel_schedule(padded_width, token_count)
+        )
+        result_dtype = FlashAttention2.OUTPUT_DTYPE
+        result_item_bytes = 2 if result_dtype == torch.float16 else 4
+        estimated_working_bytes = (
+            query.numel() * (6 * query.element_size() + result_item_bytes)
+            + 16 * head_count * token_count
+        )
+        device_capacity = torch.cuda.get_device_properties(query.device).total_memory
+        use_managed_storage = (
+            FlashAttention2.USE_MANAGED_OUTPUT
+            and estimated_working_bytes > 0.92 * device_capacity
+        )
+        autograd_state.reserved_gradients = None
+        with torch.cuda.device(query.device):
+            if use_managed_storage:
+                manage_value_gradient = (
+                    FlashAttention2.MANAGED_TENSOR == "dv"
+                    and value.dtype in (torch.float16, torch.float32)
+                )
+                prefer_host, retain_allocation = (
+                    FlashAttention2.HOST_ADVISE,
+                    FlashAttention2.HOST_POOL,
+                )
+                if manage_value_gradient:
+                    output = torch.empty(
+                        (head_count, token_count, head_width),
+                        device=query.device,
+                        dtype=result_dtype,
+                    )
+                    autograd_state.reserved_gradients = (
+                        torch.empty(
+                            query.shape, device=query.device, dtype=query.dtype
+                        ),
+                        torch.empty(key.shape, device=key.device, dtype=key.dtype),
+                        _allocate_managed_storage(
+                            tuple(value.shape),
+                            value.dtype,
+                            value.device,
+                            prefer_host,
+                            retain_allocation,
+                        ),
+                    )
+                else:
+                    autograd_state.reserved_gradients = tuple(
+                        (
+                            torch.empty(
+                                item.shape, device=item.device, dtype=item.dtype
+                            )
+                            for item in (query, key, value)
+                        )
+                    )
+                    output = _allocate_managed_storage(
+                        (head_count, token_count, head_width),
+                        result_dtype,
+                        query.device,
+                        prefer_host,
+                        retain_allocation,
+                    )
+            else:
+                output = torch.empty(
+                    (head_count, token_count, head_width),
+                    device=query.device,
+                    dtype=result_dtype,
+                )
+            log_partition = torch.empty(
+                (head_count, token_count), device=query.device, dtype=torch.float32
+            )
+            output_row_sum = torch.empty_like(log_partition)
+            head_batch_count = min(head_count, FlashAttention2.PACK_HEADS)
+            if (
+                not use_managed_storage
+                and 6 * head_count * token_count * padded_width
+                <= FlashAttention2.PACK_BYTES
+            ):
+                head_batch_count = head_count
+            staging_storage = tuple(
+                (
+                    torch.empty(
+                        (head_batch_count, token_count, padded_width),
+                        device=query.device,
+                        dtype=torch.float16,
+                    )
+                    for unused_value in range(3)
+                )
+            )
+            query_tile_rows, key_tile_rows, warp_count, pipeline_depth = output_schedule
+            scaled_log2_attention = head_width ** (-0.5) * 1.4426950408889634
+            for head_begin in range(0, head_count, head_batch_count):
+                head_end = min(head_begin + head_batch_count, head_count)
+                staged_query, staged_key, staged_value = FlashAttention2.stage_operands(
+                    query[head_begin:head_end],
+                    key[head_begin:head_end],
+                    value[head_begin:head_end],
+                    staging_storage,
+                    padded_width,
+                )
+                _packed_forward_kernel[
+                    triton.cdiv(token_count, query_tile_rows), head_end - head_begin
+                ](
+                    staged_query,
+                    staged_key,
+                    staged_value,
+                    output[head_begin:head_end],
+                    log_partition[head_begin:head_end],
+                    output_row_sum[head_begin:head_end],
+                    token_count,
+                    head_width,
+                    padded_width,
+                    *output_slices,
+                    query_tile_rows,
+                    key_tile_rows,
+                    scaled_log2_attention,
+                    FlashAttention2.LIMIT,
+                    num_warps=warp_count,
+                    num_stages=pipeline_depth,
+                )
+            del staging_storage
+        autograd_state.save_for_backward(
+            query, key, value, output, log_partition, output_row_sum
+        )
+        (
+            autograd_state.padded_feature_count,
+            autograd_state.feature_slices,
+            autograd_state.key_value_slices,
+            autograd_state.heads_per_batch,
+        ) = (padded_width, output_slices, gradient_slices, head_batch_count)
+        autograd_state.query_schedule, autograd_state.key_value_schedule = (
+            query_schedule,
+            key_value_schedule,
+        )
+        return output
+
+    @staticmethod
+    def backward(autograd_state, upstream_gradient):
+        if autograd_state.uses_padded_operands:
+            query = autograd_state.saved_tensors[0]
+            _, query_launch, key_value_launch = _WideHeadExecutor.select_schedule(
+                "fp16", query.shape[-1], False, query.shape[1]
+            )
+            autograd_state.operand_precision = "fp16"
+            autograd_state.wide_query_schedule = query_launch
+            autograd_state.wide_key_value_schedule = key_value_launch
+            autograd_state.uses_dense_staging = False
+            autograd_state.wide_head_batch = autograd_state.heads_per_batch
+        return _WideHeadExecutor.compute_gradients(
+            autograd_state, upstream_gradient.contiguous()
+        )
