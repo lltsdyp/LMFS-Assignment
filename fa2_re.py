@@ -196,6 +196,11 @@ def release_pool():
             cuda_driver.cuMemFree_v2(allocation_address)
     _managed_cache.clear()
 
+
+LOG2_GAIN = tl.constexpr(10.0)
+_RN_ASM = tl.constexpr(os.environ.get("TRITON_INTERPRET", "0") != "1")
+
+
 def _split_dim(padded_dim, max_part=128):
     """Describe a padded feature axis with at most three MMA-sized pieces."""
     pieces = []
@@ -207,6 +212,7 @@ def _split_dim(padded_dim, max_part=128):
         pieces.extend([width] * count)
     missing = 3 - len(pieces)
     return tuple(pieces + [0] * missing)
+
 
 @triton.jit
 def _operand_product(lhs, rhs, mode: tl.constexpr, acc=None):
@@ -220,6 +226,7 @@ def _operand_product(lhs, rhs, mode: tl.constexpr, acc=None):
         rhs32 = rhs.to(tl.float32)
         return tl.dot(lhs32, rhs32, acc, input_precision=mode)
 
+
 @triton.jit
 def _residual_product(lhs, rhs, total):
     """Compute the low component first, then fold in the leading half."""
@@ -230,6 +237,19 @@ def _residual_product(lhs, rhs, total):
     product = tl.dot(lo, rhs16)
     product = tl.dot(hi, rhs16, product)
     return total + product
+
+
+@triton.jit
+def _rounded_accumulate(lhs, rhs):
+    """Round each completed partial sum before starting another MMA chain."""
+    if _RN_ASM:
+        return tl.inline_asm_elementwise(
+            "add.rn.f32 $0, $1, $2;", "=r,r,r", [lhs, rhs],
+            dtype=tl.float32, is_pure=True, pack=1,
+        )
+    else:
+        return lhs + rhs
+
 
 @triton.jit
 def _read_feature_major(
@@ -246,6 +266,7 @@ def _read_feature_major(
     else:
         return tl.load(ptrs)
 
+
 @triton.jit
 def _read_token_major(
     src, row_ids, valid,
@@ -261,6 +282,7 @@ def _read_token_major(
     else:
         return tl.load(ptrs)
 
+
 @triton.jit
 def _write_feature_slice(
     dst, row_ids, row_ok, data,
@@ -271,6 +293,7 @@ def _write_feature_slice(
     mask = row_ok[:, None] & (cols[None, :] < actual_dim)
     ptrs = dst + row_ids[:, None] * actual_dim + cols[None, :]
     tl.store(ptrs, data, mask)
+
 
 @triton.jit
 def _stage_dense_kernel(
@@ -310,6 +333,7 @@ def _stage_dense_kernel(
         v_data = tl.load(v_ptrs, valid, other=0)
         tl.store(v_dst + offset, v_data, valid)
 
+
 @triton.jit
 def _stage_padded_kernel(
     q_src, k_src, v_src, q_dst, k_dst, v_dst,
@@ -340,6 +364,7 @@ def _stage_padded_kernel(
         v_ptrs = v_src + head * svh + row[:, None] * svr + col[None, :] * svd
         v_data = tl.load(v_ptrs, read_ok, other=0)
         tl.store(v_dst + dst_offset, v_data.to(tl.float16), write_ok)
+
 
 @triton.jit
 def _update_output_tile(
@@ -478,6 +503,7 @@ def _update_output_tile(
         running_maximum,
         running_mass,
     )
+
 
 @triton.jit
 def _packed_forward_kernel(
@@ -688,6 +714,7 @@ def _packed_forward_kernel(
         valid_rows,
     )
 
+
 @triton.jit
 def _generic_forward_kernel(
     query_ptr,
@@ -784,6 +811,44 @@ def _generic_forward_kernel(
         row_indices < sequence_length,
     )
 
+
+@triton.jit
+def _prepare_value_reduction(
+    value_ptr,
+    upstream_ptr,
+    value_reduction_ptr,
+    value_head_stride: tl.constexpr,
+    value_row_stride: tl.constexpr,
+    value_feature_stride: tl.constexpr,
+    upstream_head_stride: tl.constexpr,
+    sequence_length: tl.constexpr,
+    feature_count: tl.constexpr,
+    feature_block: tl.constexpr,
+    row_block: tl.constexpr,
+):
+    """Reduce values for a scalar upstream derivative within each head."""
+    head_index = tl.program_id(1).to(tl.int64)
+    row_indices = tl.program_id(0) * row_block + tl.arange(0, row_block)
+    feature_indices = tl.arange(0, feature_block)
+    value = tl.load(
+        value_ptr
+        + head_index * value_head_stride
+        + row_indices[:, None] * value_row_stride
+        + feature_indices[None, :] * value_feature_stride,
+        (row_indices[:, None] < sequence_length)
+        & (feature_indices[None, :] < feature_count),
+        other=0,
+    ).to(tl.float32)
+    head_multiplier = tl.load(upstream_ptr + head_index * upstream_head_stride).to(
+        tl.float32
+    )
+    tl.store(
+        value_reduction_ptr + head_index * sequence_length + row_indices,
+        tl.sum(value, 1) * head_multiplier,
+        row_indices < sequence_length,
+    )
+
+
 @triton.jit
 def _prepare_gradient_rows(
     output_ptr,
@@ -817,18 +882,305 @@ def _prepare_gradient_rows(
         valid_elements,
         other=0,
     ).to(tl.float32)
-    output = tl.load(
-        output_ptr
-        + (head_index * sequence_length + row_indices[:, None]) * feature_count
-        + feature_indices[None, :],
-        valid_elements,
-        other=0,
+    if not (upstream_row_stride == 0 and upstream_feature_stride == 0):
+        output = tl.load(
+            output_ptr
+            + (head_index * sequence_length + row_indices[:, None]) * feature_count
+            + feature_indices[None, :],
+            valid_elements,
+            other=0,
+        )
+        tl.store(
+            row_contraction_ptr + head_index * sequence_length + row_indices,
+            tl.sum(output.to(tl.float32) * upstream_tile, 1),
+            row_indices < sequence_length,
+        )
+    if upstream_row_stride == 0:
+        value = tl.load(
+            value_ptr
+            + head_index * value_head_stride
+            + row_indices[:, None] * value_row_stride
+            + feature_indices[None, :] * value_feature_stride,
+            valid_elements,
+            other=0,
+        ).to(tl.float32)
+        tl.store(
+            value_reduction_ptr + head_index * sequence_length + row_indices,
+            tl.sum(value * upstream_tile, 1),
+            row_indices < sequence_length,
+        )
+
+
+@triton.jit
+def _update_query_gradient(
+    output_accumulator_0,
+    output_accumulator_1,
+    output_accumulator_2,
+    query_slice_0,
+    query_slice_1,
+    query_slice_2,
+    log_partition,
+    row_contraction,
+    key_base,
+    reduction_base,
+    key_indices,
+    sequence_length: tl.constexpr,
+    padded_features: tl.constexpr,
+    first_width: tl.constexpr,
+    second_width: tl.constexpr,
+    third_width: tl.constexpr,
+    score_scale: tl.constexpr,
+    check_bounds: tl.constexpr,
+):
+    """Accumulate one key tile into the query-gradient feature slices."""
+    key_bounds = key_indices < sequence_length
+    key_slice_0 = _read_feature_major(
+        key_base, key_indices, key_bounds, 0, first_width, padded_features, check_bounds
     )
-    tl.store(
-        row_contraction_ptr + head_index * sequence_length + row_indices,
-        tl.sum(output.to(tl.float32) * upstream_tile, 1),
-        row_indices < sequence_length,
+    score_product = tl.dot(query_slice_0, key_slice_0)
+    if second_width > 0:
+        key_slice_1 = _read_feature_major(
+            key_base,
+            key_indices,
+            key_bounds,
+            first_width,
+            second_width,
+            padded_features,
+            check_bounds,
+        )
+        score_product = tl.dot(query_slice_1, key_slice_1, score_product)
+    if third_width > 0:
+        key_slice_2 = _read_feature_major(
+            key_base,
+            key_indices,
+            key_bounds,
+            first_width + second_width,
+            third_width,
+            padded_features,
+            check_bounds,
+        )
+        score_product = tl.dot(query_slice_2, key_slice_2, score_product)
+    probabilities = tl.math.exp2(score_product * score_scale - log_partition[:, None])
+    if check_bounds:
+        value_reduction_tile = tl.load(
+            reduction_base + key_indices, key_bounds, other=0
+        )
+        probabilities = tl.where(key_bounds[None, :], probabilities, 0)
+    else:
+        value_reduction_tile = tl.load(reduction_base + key_indices)
+    score_gradient = (
+        probabilities * (value_reduction_tile[None, :] - row_contraction[:, None])
+    ).to(tl.float16)
+    # Keep a row-oriented load here: reusing the score operand via transpose can
+    # replace the intended asynchronous transfer with a register-layout conversion.
+    output_accumulator_0 = tl.dot(
+        score_gradient,
+        _read_token_major(
+            key_base,
+            key_indices,
+            key_bounds,
+            0,
+            first_width,
+            padded_features,
+            check_bounds,
+        ),
+        output_accumulator_0,
     )
+    if second_width > 0:
+        output_accumulator_1 = tl.dot(
+            score_gradient,
+            _read_token_major(
+                key_base,
+                key_indices,
+                key_bounds,
+                first_width,
+                second_width,
+                padded_features,
+                check_bounds,
+            ),
+            output_accumulator_1,
+        )
+    if third_width > 0:
+        output_accumulator_2 = tl.dot(
+            score_gradient,
+            _read_token_major(
+                key_base,
+                key_indices,
+                key_bounds,
+                first_width + second_width,
+                third_width,
+                padded_features,
+                check_bounds,
+            ),
+            output_accumulator_2,
+        )
+    return (output_accumulator_0, output_accumulator_1, output_accumulator_2)
+
+
+@triton.jit
+def _packed_query_gradient(
+    query_ptr,
+    key_ptr,
+    log_partition_ptr,
+    output_sum_ptr,
+    value_reduction_ptr,
+    upstream_ptr,
+    query_gradient_ptr,
+    upstream_head_stride: tl.constexpr,
+    sequence_length: tl.constexpr,
+    feature_count: tl.constexpr,
+    padded_features: tl.constexpr,
+    first_width: tl.constexpr,
+    second_width: tl.constexpr,
+    third_width: tl.constexpr,
+    query_block: tl.constexpr,
+    key_block: tl.constexpr,
+    score_scale: tl.constexpr,
+    gradient_scale: tl.constexpr,
+):
+    """Evaluate the broadcast-gradient query path with saved row statistics."""
+    head_index = tl.program_id(1).to(tl.int64)
+    row_indices = tl.program_id(0) * query_block + tl.arange(0, query_block)
+    valid_rows = row_indices < sequence_length
+    head_base = head_index * sequence_length * padded_features
+    head_multiplier = tl.load(upstream_ptr + head_index * upstream_head_stride).to(
+        tl.float32
+    )
+    log_partition = (
+        tl.load(
+            log_partition_ptr + head_index * sequence_length + row_indices,
+            valid_rows,
+            other=0,
+        )
+        - LOG2_GAIN
+    )
+    row_contraction = (
+        tl.load(
+            output_sum_ptr + head_index * sequence_length + row_indices,
+            valid_rows,
+            other=0,
+        )
+        * head_multiplier
+    )
+    query_slice_0 = _read_token_major(
+        query_ptr + head_base,
+        row_indices,
+        valid_rows,
+        0,
+        first_width,
+        padded_features,
+        True,
+    )
+    output_accumulator_0 = tl.zeros([query_block, first_width], tl.float32)
+    if second_width > 0:
+        query_slice_1 = _read_token_major(
+            query_ptr + head_base,
+            row_indices,
+            valid_rows,
+            first_width,
+            second_width,
+            padded_features,
+            True,
+        )
+        output_accumulator_1 = tl.zeros([query_block, second_width], tl.float32)
+    else:
+        query_slice_1 = tl.zeros([1], tl.float16)
+        output_accumulator_1 = tl.zeros([1], tl.float32)
+    if third_width > 0:
+        query_slice_2 = _read_token_major(
+            query_ptr + head_base,
+            row_indices,
+            valid_rows,
+            first_width + second_width,
+            third_width,
+            padded_features,
+            True,
+        )
+        output_accumulator_2 = tl.zeros([query_block, third_width], tl.float32)
+    else:
+        query_slice_2 = tl.zeros([1], tl.float16)
+        output_accumulator_2 = tl.zeros([1], tl.float32)
+    key_base = key_ptr + head_base
+    reduction_base = value_reduction_ptr + head_index * sequence_length
+    column_indices = tl.arange(0, key_block)
+    complete_tiles: tl.constexpr = sequence_length // key_block
+    for tile_index in range(complete_tiles):
+        output_accumulator_0, output_accumulator_1, output_accumulator_2 = (
+            _update_query_gradient(
+                output_accumulator_0,
+                output_accumulator_1,
+                output_accumulator_2,
+                query_slice_0,
+                query_slice_1,
+                query_slice_2,
+                log_partition,
+                row_contraction,
+                key_base,
+                reduction_base,
+                tile_index * key_block + column_indices,
+                sequence_length,
+                padded_features,
+                first_width,
+                second_width,
+                third_width,
+                score_scale,
+                False,
+            )
+        )
+    if complete_tiles * key_block < sequence_length:
+        output_accumulator_0, output_accumulator_1, output_accumulator_2 = (
+            _update_query_gradient(
+                output_accumulator_0,
+                output_accumulator_1,
+                output_accumulator_2,
+                query_slice_0,
+                query_slice_1,
+                query_slice_2,
+                log_partition,
+                row_contraction,
+                key_base,
+                reduction_base,
+                complete_tiles * key_block + column_indices,
+                sequence_length,
+                padded_features,
+                first_width,
+                second_width,
+                third_width,
+                score_scale,
+                True,
+            )
+        )
+    destination_ptr = query_gradient_ptr + head_index * sequence_length * feature_count
+    _write_feature_slice(
+        destination_ptr,
+        row_indices,
+        valid_rows,
+        output_accumulator_0 * gradient_scale,
+        0,
+        first_width,
+        feature_count,
+    )
+    if second_width > 0:
+        _write_feature_slice(
+            destination_ptr,
+            row_indices,
+            valid_rows,
+            output_accumulator_1 * gradient_scale,
+            first_width,
+            second_width,
+            feature_count,
+        )
+    if third_width > 0:
+        _write_feature_slice(
+            destination_ptr,
+            row_indices,
+            valid_rows,
+            output_accumulator_2 * gradient_scale,
+            first_width + second_width,
+            third_width,
+            feature_count,
+        )
+
 
 @triton.jit
 def _generic_query_gradient(
@@ -895,6 +1247,10 @@ def _generic_query_gradient(
         row_indices < sequence_length,
         other=0,
     )
+    if upstream_row_stride == 0 and upstream_feature_stride == 0:
+        row_contraction *= tl.load(upstream_ptr + head_index * upstream_head_stride).to(
+            tl.float32
+        )
     accumulator = tl.full((query_block, feature_block), 0, tl.float32)
     probability_gain: tl.constexpr = 1024.0 if precision_mode == "fp16" else 1.0
     for tile_index in range(tl.cdiv(sequence_length, key_block)):
@@ -917,17 +1273,24 @@ def _generic_query_gradient(
         probabilities = tl.where(
             key_indices[None, :] < sequence_length, probabilities, 0
         )
-        transposed_values = tl.load(
-            value_ptr
-            + head_index * value_head_stride
-            + feature_indices[:, None] * value_feature_stride
-            + key_indices[None, :] * value_row_stride,
-            valid_transposed_elements,
-            other=0,
-        )
-        probability_gradient = _operand_product(
-            upstream_tile, transposed_values, precision_mode
-        )
+        if upstream_row_stride == 0:
+            probability_gradient = tl.load(
+                value_reduction_ptr + head_index * sequence_length + key_indices,
+                key_indices < sequence_length,
+                other=0,
+            )[None, :]
+        else:
+            transposed_values = tl.load(
+                value_ptr
+                + head_index * value_head_stride
+                + feature_indices[:, None] * value_feature_stride
+                + key_indices[None, :] * value_row_stride,
+                valid_transposed_elements,
+                other=0,
+            )
+            probability_gradient = _operand_product(
+                upstream_tile, transposed_values, precision_mode
+            )
         score_gradient = (
             probabilities
             * (probability_gradient - row_contraction[:, None])
@@ -943,6 +1306,401 @@ def _generic_query_gradient(
         accumulator * (attention_scale / probability_gain),
         valid_elements,
     )
+
+
+@triton.jit
+def _update_key_value_gradient(
+    partial_slice_0,
+    partial_slice_1,
+    partial_slice_2,
+    probability_total,
+    key_slice_0,
+    key_slice_1,
+    key_slice_2,
+    value_reduction,
+    head_multiplier,
+    query_base,
+    log_partition_base,
+    output_sum_base,
+    query_indices,
+    sequence_length: tl.constexpr,
+    padded_features: tl.constexpr,
+    first_width: tl.constexpr,
+    second_width: tl.constexpr,
+    third_width: tl.constexpr,
+    score_scale: tl.constexpr,
+    check_bounds: tl.constexpr,
+    reset_partial: tl.constexpr,
+):
+    """Form a key-gradient partial and update the value-gradient row sum."""
+    query_bounds = query_indices < sequence_length
+    query_transpose_slice_0 = _read_feature_major(
+        query_base,
+        query_indices,
+        query_bounds,
+        0,
+        first_width,
+        padded_features,
+        check_bounds,
+    )
+    transposed_score_product = tl.dot(key_slice_0, query_transpose_slice_0)
+    if second_width > 0:
+        query_transpose_slice_1 = _read_feature_major(
+            query_base,
+            query_indices,
+            query_bounds,
+            first_width,
+            second_width,
+            padded_features,
+            check_bounds,
+        )
+        transposed_score_product = tl.dot(
+            key_slice_1, query_transpose_slice_1, transposed_score_product
+        )
+    if third_width > 0:
+        query_transpose_slice_2 = _read_feature_major(
+            query_base,
+            query_indices,
+            query_bounds,
+            first_width + second_width,
+            third_width,
+            padded_features,
+            check_bounds,
+        )
+        transposed_score_product = tl.dot(
+            key_slice_2, query_transpose_slice_2, transposed_score_product
+        )
+    if check_bounds:
+        log_partition = (
+            tl.load(log_partition_base + query_indices, query_bounds, other=0)
+            - LOG2_GAIN
+        )
+        row_contraction = (
+            tl.load(output_sum_base + query_indices, query_bounds, other=0)
+            * head_multiplier
+        )
+    else:
+        log_partition = tl.load(log_partition_base + query_indices) - LOG2_GAIN
+        row_contraction = tl.load(output_sum_base + query_indices) * head_multiplier
+    probabilities = tl.math.exp2(
+        transposed_score_product * score_scale - log_partition[None, :]
+    )
+    if check_bounds:
+        probabilities = tl.where(query_bounds[None, :], probabilities, 0)
+    probability_total += tl.sum(probabilities, 1)
+    score_gradient = (
+        probabilities * (value_reduction[:, None] - row_contraction[None, :])
+    ).to(tl.float16)
+    query_row_slice_0 = _read_token_major(
+        query_base,
+        query_indices,
+        query_bounds,
+        0,
+        first_width,
+        padded_features,
+        check_bounds,
+    )
+    if second_width > 0:
+        query_row_slice_1 = _read_token_major(
+            query_base,
+            query_indices,
+            query_bounds,
+            first_width,
+            second_width,
+            padded_features,
+            check_bounds,
+        )
+    if third_width > 0:
+        query_row_slice_2 = _read_token_major(
+            query_base,
+            query_indices,
+            query_bounds,
+            first_width + second_width,
+            third_width,
+            padded_features,
+            check_bounds,
+        )
+    if reset_partial:
+        partial_slice_0 = tl.dot(score_gradient, query_row_slice_0)
+        if second_width > 0:
+            partial_slice_1 = tl.dot(score_gradient, query_row_slice_1)
+        if third_width > 0:
+            partial_slice_2 = tl.dot(score_gradient, query_row_slice_2)
+    else:
+        partial_slice_0 = tl.dot(score_gradient, query_row_slice_0, partial_slice_0)
+        if second_width > 0:
+            partial_slice_1 = tl.dot(score_gradient, query_row_slice_1, partial_slice_1)
+        if third_width > 0:
+            partial_slice_2 = tl.dot(score_gradient, query_row_slice_2, partial_slice_2)
+    return (partial_slice_0, partial_slice_1, partial_slice_2, probability_total)
+
+
+@triton.jit
+def _packed_key_value_gradient(
+    query_ptr,
+    key_ptr,
+    log_partition_ptr,
+    output_sum_ptr,
+    value_reduction_ptr,
+    upstream_ptr,
+    key_gradient_ptr,
+    value_gradient_ptr,
+    upstream_head_stride: tl.constexpr,
+    sequence_length: tl.constexpr,
+    feature_count: tl.constexpr,
+    padded_features: tl.constexpr,
+    first_width: tl.constexpr,
+    second_width: tl.constexpr,
+    third_width: tl.constexpr,
+    query_block: tl.constexpr,
+    key_block: tl.constexpr,
+    tiles_per_group: tl.constexpr,
+    score_scale: tl.constexpr,
+    gradient_scale: tl.constexpr,
+):
+    """Reduce query groups with explicit round-to-nearest additions."""
+    head_index = tl.program_id(1).to(tl.int64)
+    key_indices = tl.program_id(0) * key_block + tl.arange(0, key_block)
+    valid_keys = key_indices < sequence_length
+    head_base = head_index * sequence_length * padded_features
+    head_multiplier = tl.load(upstream_ptr + head_index * upstream_head_stride).to(
+        tl.float32
+    )
+    key_slice_0 = _read_token_major(
+        key_ptr + head_base,
+        key_indices,
+        valid_keys,
+        0,
+        first_width,
+        padded_features,
+        True,
+    )
+    key_total_0 = tl.zeros([key_block, first_width], tl.float32)
+    if second_width > 0:
+        key_slice_1 = _read_token_major(
+            key_ptr + head_base,
+            key_indices,
+            valid_keys,
+            first_width,
+            second_width,
+            padded_features,
+            True,
+        )
+        key_total_1 = tl.zeros([key_block, second_width], tl.float32)
+    else:
+        key_slice_1 = tl.zeros([1], tl.float16)
+        key_total_1 = tl.zeros([1], tl.float32)
+    if third_width > 0:
+        key_slice_2 = _read_token_major(
+            key_ptr + head_base,
+            key_indices,
+            valid_keys,
+            first_width + second_width,
+            third_width,
+            padded_features,
+            True,
+        )
+        key_total_2 = tl.zeros([key_block, third_width], tl.float32)
+    else:
+        key_slice_2 = tl.zeros([1], tl.float16)
+        key_total_2 = tl.zeros([1], tl.float32)
+    value_reduction = tl.load(
+        value_reduction_ptr + head_index * sequence_length + key_indices,
+        valid_keys,
+        other=0,
+    )
+    probability_total = tl.zeros([key_block], tl.float32)
+    query_base = query_ptr + head_base
+    log_partition_base = log_partition_ptr + head_index * sequence_length
+    output_sum_base = output_sum_ptr + head_index * sequence_length
+    row_indices = tl.arange(0, query_block)
+    complete_tiles: tl.constexpr = sequence_length // query_block
+    complete_groups: tl.constexpr = complete_tiles // tiles_per_group
+    for batch_index in range(complete_groups):
+        for within_group in tl.static_range(tiles_per_group):
+            if within_group == 0:
+                partial_slice_0, partial_slice_1, partial_slice_2, probability_total = (
+                    _update_key_value_gradient(
+                        key_total_0,
+                        key_total_1,
+                        key_total_2,
+                        probability_total,
+                        key_slice_0,
+                        key_slice_1,
+                        key_slice_2,
+                        value_reduction,
+                        head_multiplier,
+                        query_base,
+                        log_partition_base,
+                        output_sum_base,
+                        (batch_index * tiles_per_group + within_group) * query_block
+                        + row_indices,
+                        sequence_length,
+                        padded_features,
+                        first_width,
+                        second_width,
+                        third_width,
+                        score_scale,
+                        False,
+                        True,
+                    )
+                )
+            else:
+                partial_slice_0, partial_slice_1, partial_slice_2, probability_total = (
+                    _update_key_value_gradient(
+                        partial_slice_0,
+                        partial_slice_1,
+                        partial_slice_2,
+                        probability_total,
+                        key_slice_0,
+                        key_slice_1,
+                        key_slice_2,
+                        value_reduction,
+                        head_multiplier,
+                        query_base,
+                        log_partition_base,
+                        output_sum_base,
+                        (batch_index * tiles_per_group + within_group) * query_block
+                        + row_indices,
+                        sequence_length,
+                        padded_features,
+                        first_width,
+                        second_width,
+                        third_width,
+                        score_scale,
+                        False,
+                        False,
+                    )
+                )
+        key_total_0 = _rounded_accumulate(key_total_0, partial_slice_0)
+        if second_width > 0:
+            key_total_1 = _rounded_accumulate(key_total_1, partial_slice_1)
+        if third_width > 0:
+            key_total_2 = _rounded_accumulate(key_total_2, partial_slice_2)
+    for tile_index in range(complete_groups * tiles_per_group, complete_tiles):
+        remainder_slice_0, remainder_slice_1, remainder_slice_2, probability_total = (
+            _update_key_value_gradient(
+                key_total_0,
+                key_total_1,
+                key_total_2,
+                probability_total,
+                key_slice_0,
+                key_slice_1,
+                key_slice_2,
+                value_reduction,
+                head_multiplier,
+                query_base,
+                log_partition_base,
+                output_sum_base,
+                tile_index * query_block + row_indices,
+                sequence_length,
+                padded_features,
+                first_width,
+                second_width,
+                third_width,
+                score_scale,
+                False,
+                True,
+            )
+        )
+        key_total_0 = _rounded_accumulate(key_total_0, remainder_slice_0)
+        if second_width > 0:
+            key_total_1 = _rounded_accumulate(key_total_1, remainder_slice_1)
+        if third_width > 0:
+            key_total_2 = _rounded_accumulate(key_total_2, remainder_slice_2)
+    if complete_tiles * query_block < sequence_length:
+        tail_slice_0, tail_slice_1, tail_slice_2, probability_total = (
+            _update_key_value_gradient(
+                key_total_0,
+                key_total_1,
+                key_total_2,
+                probability_total,
+                key_slice_0,
+                key_slice_1,
+                key_slice_2,
+                value_reduction,
+                head_multiplier,
+                query_base,
+                log_partition_base,
+                output_sum_base,
+                complete_tiles * query_block + row_indices,
+                sequence_length,
+                padded_features,
+                first_width,
+                second_width,
+                third_width,
+                score_scale,
+                True,
+                True,
+            )
+        )
+        key_total_0 = _rounded_accumulate(key_total_0, tail_slice_0)
+        if second_width > 0:
+            key_total_1 = _rounded_accumulate(key_total_1, tail_slice_1)
+        if third_width > 0:
+            key_total_2 = _rounded_accumulate(key_total_2, tail_slice_2)
+    key_destination = key_gradient_ptr + head_index * sequence_length * feature_count
+    value_destination = (
+        value_gradient_ptr + head_index * sequence_length * feature_count
+    )
+    value_gradient = probability_total * (head_multiplier / 2.0**LOG2_GAIN)
+    _write_feature_slice(
+        key_destination,
+        key_indices,
+        valid_keys,
+        key_total_0 * gradient_scale,
+        0,
+        first_width,
+        feature_count,
+    )
+    _write_feature_slice(
+        value_destination,
+        key_indices,
+        valid_keys,
+        tl.broadcast_to(value_gradient[:, None], (key_block, first_width)),
+        0,
+        first_width,
+        feature_count,
+    )
+    if second_width > 0:
+        _write_feature_slice(
+            key_destination,
+            key_indices,
+            valid_keys,
+            key_total_1 * gradient_scale,
+            first_width,
+            second_width,
+            feature_count,
+        )
+        _write_feature_slice(
+            value_destination,
+            key_indices,
+            valid_keys,
+            tl.broadcast_to(value_gradient[:, None], (key_block, second_width)),
+            first_width,
+            second_width,
+            feature_count,
+        )
+    if third_width > 0:
+        _write_feature_slice(
+            key_destination,
+            key_indices,
+            valid_keys,
+            key_total_2 * gradient_scale,
+            first_width + second_width,
+            third_width,
+            feature_count,
+        )
+        _write_feature_slice(
+            value_destination,
+            key_indices,
+            valid_keys,
+            tl.broadcast_to(value_gradient[:, None], (key_block, third_width)),
+            first_width + second_width,
+            third_width,
+            feature_count,
+        )
+
 
 @triton.jit
 def _generic_key_value_gradient(
@@ -993,15 +1751,30 @@ def _generic_key_value_gradient(
         other=0,
     )
     key_accumulator = tl.full((key_block, feature_block), 0, tl.float32)
-    value = tl.load(
-        value_ptr
-        + head_index * value_head_stride
-        + key_indices[:, None] * value_row_stride
-        + feature_indices[None, :] * value_feature_stride,
-        valid_elements,
-        other=0,
-    )
-    value_accumulator = tl.full((key_block, feature_block), 0, tl.float32)
+    if upstream_row_stride == 0:
+        upstream_vector = tl.load(
+            upstream_ptr
+            + head_index * upstream_head_stride
+            + feature_indices * upstream_feature_stride,
+            feature_indices < feature_count,
+            other=0,
+        ).to(tl.float32)
+        probability_gradient_vector = tl.load(
+            value_reduction_ptr + head_index * sequence_length + key_indices,
+            key_indices < sequence_length,
+            other=0,
+        )
+        probability_accumulator = tl.full((key_block,), 0, tl.float32)
+    else:
+        value = tl.load(
+            value_ptr
+            + head_index * value_head_stride
+            + key_indices[:, None] * value_row_stride
+            + feature_indices[None, :] * value_feature_stride,
+            valid_elements,
+            other=0,
+        )
+        value_accumulator = tl.full((key_block, feature_block), 0, tl.float32)
     probability_gain: tl.constexpr = 1024.0 if precision_mode == "fp16" else 1.0
     for tile_index in range(tl.cdiv(sequence_length, query_block)):
         query_indices = tile_index * query_block + row_indices
@@ -1034,6 +1807,10 @@ def _generic_key_value_gradient(
             query_indices < sequence_length,
             other=0,
         )
+        if upstream_row_stride == 0 and upstream_feature_stride == 0:
+            row_contraction *= tl.load(
+                upstream_ptr + head_index * upstream_head_stride
+            ).to(tl.float32)
         score_tile = (
             _operand_product(key, transposed_queries, precision_mode) * score_scale
         )
@@ -1041,9 +1818,12 @@ def _generic_key_value_gradient(
         probabilities = tl.where(
             query_indices[None, :] < sequence_length, probabilities, 0
         )
-        probability_gradient = _operand_product(
-            value, transposed_upstream, precision_mode
-        )
+        if upstream_row_stride == 0:
+            probability_gradient = probability_gradient_vector[:, None]
+        else:
+            probability_gradient = _operand_product(
+                value, transposed_upstream, precision_mode
+            )
         score_gradient = (
             probabilities
             * (probability_gradient - row_contraction[None, :])
@@ -1060,12 +1840,15 @@ def _generic_key_value_gradient(
                 precision_mode,
                 key_accumulator,
             )
-        value_accumulator = _operand_product(
-            probabilities * probability_gain,
-            tl.trans(transposed_upstream),
-            precision_mode,
-            value_accumulator,
-        )
+        if upstream_row_stride == 0:
+            probability_accumulator += tl.sum(probabilities, 1)
+        else:
+            value_accumulator = _operand_product(
+                probabilities * probability_gain,
+                tl.trans(transposed_upstream),
+                precision_mode,
+                value_accumulator,
+            )
     tl.store(
         key_gradient_ptr
         + (head_index * sequence_length + key_indices[:, None]) * feature_count
@@ -1073,7 +1856,12 @@ def _generic_key_value_gradient(
         key_accumulator * (attention_scale / probability_gain),
         valid_elements,
     )
-    value_gradient_tile = value_accumulator / probability_gain
+    if upstream_row_stride == 0:
+        value_gradient_tile = (
+            probability_accumulator[:, None] * upstream_vector[None, :]
+        )
+    else:
+        value_gradient_tile = value_accumulator / probability_gain
     tl.store(
         value_gradient_ptr
         + (head_index * sequence_length + key_indices[:, None]) * feature_count
@@ -1081,6 +1869,7 @@ def _generic_key_value_gradient(
         value_gradient_tile,
         valid_elements,
     )
+
 
 class _WideHeadExecutor:
     """Dispatch the original wide-head path without changing its storage policy."""
@@ -1402,6 +2191,7 @@ class _WideHeadExecutor:
                 )
         return (query_gradient, key_gradient, value_gradient)
 
+
 class FlashAttention2(torch.autograd.Function):
     """Evaluator-compatible attention for equal-shaped CUDA [H, N, D] inputs.
 
@@ -1649,16 +2439,247 @@ class FlashAttention2(torch.autograd.Function):
 
     @staticmethod
     def backward(autograd_state, upstream_gradient):
-        if autograd_state.uses_padded_operands:
-            query = autograd_state.saved_tensors[0]
-            _, query_launch, key_value_launch = _WideHeadExecutor.select_schedule(
-                "fp16", query.shape[-1], False, query.shape[1]
+        if not autograd_state.uses_padded_operands:
+            # Preserve A's dense-gradient workaround for the wide-head fallback.
+            return _WideHeadExecutor.compute_gradients(
+                autograd_state, upstream_gradient.contiguous()
             )
-            autograd_state.operand_precision = "fp16"
-            autograd_state.wide_query_schedule = query_launch
-            autograd_state.wide_key_value_schedule = key_value_launch
-            autograd_state.uses_dense_staging = False
-            autograd_state.wide_head_batch = autograd_state.heads_per_batch
-        return _WideHeadExecutor.compute_gradients(
-            autograd_state, upstream_gradient.contiguous()
+        return FlashAttention2._backward_packed(autograd_state, upstream_gradient)
+
+    @staticmethod
+    def _backward_packed(autograd_state, upstream_gradient):
+        query, key, value, output, log_partition, output_row_sum = (
+            autograd_state.saved_tensors
         )
+        head_count, token_count, head_width = query.shape
+        padded_width, output_slices, gradient_slices = (
+            autograd_state.padded_feature_count,
+            autograd_state.feature_slices,
+            autograd_state.key_value_slices,
+        )
+        if autograd_state.reserved_gradients is not None:
+            query_gradient, key_gradient, value_gradient = (
+                autograd_state.reserved_gradients
+            )
+            del autograd_state.reserved_gradients
+        else:
+            query_gradient = torch.empty(
+                query.shape, device=query.device, dtype=query.dtype
+            )
+            key_gradient = torch.empty(key.shape, device=key.device, dtype=key.dtype)
+            value_gradient = torch.empty(
+                value.shape, device=value.device, dtype=value.dtype
+            )
+        head_batch_count = autograd_state.heads_per_batch
+        broadcast_upstream = (
+            upstream_gradient.stride(1) == 0 and upstream_gradient.stride(2) == 0
+        )
+        unscaled_attention = head_width ** (-0.5)
+        scaled_log2_attention = unscaled_attention * 1.4426950408889634
+        with torch.cuda.device(query.device):
+            if broadcast_upstream:
+                value_reduction = torch.empty(
+                    (head_count, token_count), device=query.device, dtype=torch.float32
+                )
+                _prepare_value_reduction[triton.cdiv(token_count, 64), head_count](
+                    value,
+                    upstream_gradient,
+                    value_reduction,
+                    *value.stride(),
+                    upstream_gradient.stride(0),
+                    token_count,
+                    head_width,
+                    triton.next_power_of_2(head_width),
+                    64,
+                    num_warps=4,
+                )
+                staging_storage = tuple(
+                    (
+                        torch.empty(
+                            (head_batch_count, token_count, padded_width),
+                            device=query.device,
+                            dtype=torch.float16,
+                        )
+                        for unused_value in range(2)
+                    )
+                )
+                staging_storage = staging_storage + (staging_storage[0],)
+                (
+                    query_gradient_rows,
+                    query_gradient_keys,
+                    query_gradient_warps,
+                    query_gradient_stages,
+                ) = autograd_state.query_schedule
+                (
+                    key_gradient_queries,
+                    key_gradient_rows,
+                    key_gradient_warps,
+                    key_gradient_stages,
+                    partial_group_size,
+                ) = autograd_state.key_value_schedule
+                gradient_output_scale = unscaled_attention / 1024.0
+                for head_begin in range(0, head_count, head_batch_count):
+                    head_end = min(head_begin + head_batch_count, head_count)
+                    staged_query, staged_key, unused_value = (
+                        FlashAttention2.stage_operands(
+                            query[head_begin:head_end],
+                            key[head_begin:head_end],
+                            value[head_begin:head_end],
+                            staging_storage,
+                            padded_width,
+                            include_values=False,
+                        )
+                    )
+                    upstream_batch = upstream_gradient[head_begin:head_end]
+                    shared_arguments = (
+                        log_partition[head_begin:head_end],
+                        output_row_sum[head_begin:head_end],
+                        value_reduction[head_begin:head_end],
+                        upstream_batch,
+                    )
+                    _packed_query_gradient[
+                        triton.cdiv(token_count, query_gradient_rows),
+                        head_end - head_begin,
+                    ](
+                        staged_query,
+                        staged_key,
+                        *shared_arguments,
+                        query_gradient[head_begin:head_end],
+                        upstream_batch.stride(0),
+                        token_count,
+                        head_width,
+                        padded_width,
+                        *output_slices,
+                        query_gradient_rows,
+                        query_gradient_keys,
+                        scaled_log2_attention,
+                        gradient_output_scale,
+                        num_warps=query_gradient_warps,
+                        num_stages=query_gradient_stages,
+                    )
+                    _packed_key_value_gradient[
+                        triton.cdiv(token_count, key_gradient_rows),
+                        head_end - head_begin,
+                    ](
+                        staged_query,
+                        staged_key,
+                        *shared_arguments,
+                        key_gradient[head_begin:head_end],
+                        value_gradient[head_begin:head_end],
+                        upstream_batch.stride(0),
+                        token_count,
+                        head_width,
+                        padded_width,
+                        *gradient_slices,
+                        key_gradient_queries,
+                        key_gradient_rows,
+                        partial_group_size,
+                        scaled_log2_attention,
+                        gradient_output_scale,
+                        num_warps=key_gradient_warps,
+                        num_stages=key_gradient_stages,
+                    )
+                return (query_gradient, key_gradient, value_gradient)
+            row_contraction = torch.empty(
+                (head_count, token_count), device=query.device, dtype=torch.float32
+            )
+            value_reduction = torch.empty_like(row_contraction)
+            feature_tile_width = triton.next_power_of_2(head_width)
+            _prepare_gradient_rows[triton.cdiv(token_count, 64), head_count](
+                output,
+                upstream_gradient,
+                value,
+                row_contraction,
+                value_reduction,
+                *value.stride(),
+                *upstream_gradient.stride(),
+                token_count,
+                head_width,
+                feature_tile_width,
+                64,
+                num_warps=4,
+            )
+            unused_value, query_launch, key_value_launch = (
+                _WideHeadExecutor.select_schedule(
+                    "fp16", head_width, False, token_count
+                )
+            )
+            staging_storage = tuple(
+                (
+                    torch.empty(
+                        (head_batch_count, token_count, padded_width),
+                        device=query.device,
+                        dtype=torch.float16,
+                    )
+                    for unused_value in range(3)
+                )
+            )
+            requires_value_tiles = upstream_gradient.stride(1) != 0
+            for head_begin in range(0, head_count, head_batch_count):
+                head_end = min(head_begin + head_batch_count, head_count)
+                query_batch, key_batch, value_batch = FlashAttention2.stage_operands(
+                    query[head_begin:head_end],
+                    key[head_begin:head_end],
+                    value[head_begin:head_end],
+                    staging_storage,
+                    padded_width,
+                    include_values=requires_value_tiles,
+                )
+                upstream_batch = upstream_gradient[head_begin:head_end]
+                shared_arguments = (
+                    *query_batch.stride(),
+                    *key_batch.stride(),
+                    *value_batch.stride(),
+                    *upstream_batch.stride(),
+                    token_count,
+                    head_width,
+                    feature_tile_width,
+                )
+                query_tile_rows, key_tile_rows, warp_count, pipeline_depth = (
+                    query_launch
+                )
+                _generic_query_gradient[
+                    triton.cdiv(token_count, query_tile_rows), head_end - head_begin
+                ](
+                    query_batch,
+                    key_batch,
+                    value_batch,
+                    upstream_batch,
+                    log_partition[head_begin:head_end],
+                    row_contraction[head_begin:head_end],
+                    value_reduction[head_begin:head_end],
+                    query_gradient[head_begin:head_end],
+                    *shared_arguments,
+                    query_tile_rows,
+                    key_tile_rows,
+                    scaled_log2_attention,
+                    unscaled_attention,
+                    "fp16",
+                    num_warps=warp_count,
+                    num_stages=pipeline_depth,
+                )
+                query_tile_rows, key_tile_rows, warp_count, pipeline_depth = (
+                    key_value_launch
+                )
+                _generic_key_value_gradient[
+                    triton.cdiv(token_count, key_tile_rows), head_end - head_begin
+                ](
+                    query_batch,
+                    key_batch,
+                    value_batch,
+                    upstream_batch,
+                    log_partition[head_begin:head_end],
+                    row_contraction[head_begin:head_end],
+                    value_reduction[head_begin:head_end],
+                    key_gradient[head_begin:head_end],
+                    value_gradient[head_begin:head_end],
+                    *shared_arguments,
+                    query_tile_rows,
+                    key_tile_rows,
+                    scaled_log2_attention,
+                    unscaled_attention,
+                    "fp16",
+                    num_warps=warp_count,
+                    num_stages=pipeline_depth,
+                )
+        return (query_gradient, key_gradient, value_gradient)
